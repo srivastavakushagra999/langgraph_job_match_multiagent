@@ -37,12 +37,15 @@ Agent should come back with something like:
 - Job Y — 55% fit — good backend match but they want RAG/vector DB
   experience I don't have listed on resume.
 
-## Current state
-Nothing built yet in this repo — `job_matcher/` doesn't exist here. Starting
-from a clean slate. (Earlier notes below describing `data.py`/`tools.py`/
+## Current state (updated 2026-08-21)
+`job_matcher/schemas.py` is done — `JobListing`, `Preferences`, `ScoredJob`
+pydantic models, all reviewed. Confirmed against real RemoteOK API output
+(see "RemoteOK API — confirmed response shape" below). `fit_score` is
+constrained `Field(ge=0, le=100)` since it's LLM judgment, not a computed
+value — the range check is a backstop against hallucinated out-of-range
+scores. (Earlier notes below describing `data.py`/`tools.py`/
 `graph_version.py`/`functional_version.py` as "already built" refer to a
-prior prototype, not code present in this repo — treat the plan below as
-the actual starting point.)
+prior prototype, not code present in this repo.)
 
 **Collaboration style**: I'm writing the implementation myself. Claude's
 role here is to guide — explain concepts, propose structure, review code
@@ -50,8 +53,35 @@ I write, flag issues — not to write the agent code wholesale. I'm using
 this project to learn LangGraph properly, not just to end up with a
 working tool.
 
-**Next step**: draft `schemas.py` — `Preferences`, `JobListing`,
-`ScoredJob` pydantic models (see confirmed schema below).
+**Next step**: `OrchestratorState` (`TypedDict`) + start of the LangGraph
+graph itself — wraps `Preferences`, `resume_text: str`,
+`job_listings: list[JobListing]`, `expanded_keywords`, `context_signals`,
+`realistic_matches`/`stretch_matches: list[ScoredJob]` (see full shape in
+"Confirmed schema and flow" section below). Not started yet.
+
+## RemoteOK API — confirmed response shape (checked 2026-08-21)
+Pulled via `curl -s https://remoteok.com/api | python3 -m json.tool`.
+Notes that matter for the `search_jobs` tool (not written yet):
+- First array element is a legal-notice object (`{"legal": "...", "last_updated": ...}`),
+  no `id`/`position` — must be skipped when parsing (`if "id" not in item: skip`).
+- Real fields per job: `slug`, `id`, `epoch`, `date`, `company`,
+  `company_logo`, `position`, `tags`, `description`, `location`,
+  `apply_url`, `salary_min`, `salary_max`, `logo`, `url`.
+- `salary_min`/`salary_max` are `0`, not `null`, when unspecified — must
+  convert `0 → None` when building `JobListing` (`raw["salary_min"] or None`),
+  otherwise "unknown salary" and "literally pays $0" are indistinguishable
+  downstream. **Locked decision: never hard-filter out jobs with missing
+  salary — always pass them through and let Score/Dreamer reason about the
+  "unknown" explicitly**, since a missing salary field doesn't mean it's a
+  bad match.
+- `description` contains raw HTML tags and a spam-prevention boilerplate
+  line ("Please mention the word **X**...") baked into every listing —
+  pure noise, worth stripping before it reaches `JobListing`/LLM prompts
+  (token cost + irrelevant to fit reasoning).
+- The feed is noisier than expected — sample pull included a hotel Loss
+  Prevention Officer and an H&M retail Sales Advisor, neither remote nor
+  tech-related. Keyword filtering in `search_jobs` will be doing real
+  work, not a formality.
 
 ## Decisions locked in
 - **Resume input**: PDF upload, agent parses it (need a PDF-to-text step —
@@ -118,22 +148,30 @@ class Preferences(BaseModel):
     base_location: str             # e.g. "Netherlands" — used to check
                                     # region-restricted remote listings,
                                     # NOT for relocation
-    remote_scope: str               # "worldwide" | "EU" | specific region —
-                                    # how wide a net for remote roles
-    open_to_relocation: bool        # separate concept from remote_scope —
-                                    # would they physically move
+    open_to_onsite_at_base: bool    # would they work non-remote IF the job
+                                    # is physically at base_location — NOT
+                                    # willingness to relocate elsewhere.
+                                    # Non-remote job located anywhere other
+                                    # than base_location is always rejected
+                                    # regardless of this flag.
     additional_context: str | None  # optional free text: career-change
                                     # motivation, industries to avoid, etc.
                                     # Passed through as raw narrative to
                                     # Score/Dreamer prompts — never parsed
                                     # into structured fields.
 ```
-`base_location` vs `remote_scope` split matters: RemoteOK listings are
-often region-restricted ("Remote — US only") even when tagged remote, so
-Score Agent needs the user's real base location to judge eligibility, not
-just a `remote: true` flag. This is a hard fit-breaker rule for Score
+`base_location` is used for a hard eligibility check: RemoteOK listings
+are often region-restricted ("Remote — US only") even when tagged remote,
+so Score Agent needs the user's real base location to judge eligibility,
+not just a `remote: true` flag. This is a hard fit-breaker rule for Score
 Agent: a job whose remote eligibility excludes `base_location` should be
 flagged plainly, not scored as a good match regardless of skill overlap.
+
+(2026-08-21: dropped a separate `remote_scope` field that was here
+earlier — it would have added a "how wide a net for remote roles"
+preference on top of eligibility, but the actual goal is simpler: show
+jobs the user is eligible to work from `base_location`, nothing more.
+`base_location` + `remote` alone answer that.)
 
 **Confirmed flow** (no `extract_preferences` LLM step — removed after
 deciding preferences are a structured form, not free text):
@@ -235,7 +273,7 @@ API comparison.
   existing stack, no separate frontend build needed
 - Inputs: structured form for preferences (see confirmed `Preferences`
   schema above: role, remote, salary_min, currency, base_location,
-  remote_scope, open_to_relocation) + optional free text field ("anything
+  open_to_onsite_at_base) + optional free text field ("anything
   else about yourself or what you're looking for") + resume PDF uploader
 - Output: two-section results view —
   - "Realistic Matches" — Score Agent results, as cards (job title,
