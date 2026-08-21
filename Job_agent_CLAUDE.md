@@ -266,3 +266,98 @@ Based in Netherlands, working in Europe broadly is fine.
   in-run state); cross-session long-term memory can start as a local
   SQLite file on the Hetzner VM — no external DB service required
 - Add `streamlit`, `pypdf`, and `langsmith` to `requirements.txt`
+
+## Design session 2026-08-21 — resume fallback, context handling, LLM mapping, memory schema
+
+**Resume fallback**: if no PDF uploaded in the Streamlit form, fall back to
+a default resume path in the repo (e.g. `job_matcher/data/resume.pdf`,
+gitignored — never commit the actual PDF). UI should show a caption
+indicating which source is in use (uploaded vs. default-on-file) so a run
+never silently scores against a stale resume without you noticing.
+
+**`additional_context` handling — added `context_signals` to state**:
+free text (e.g. "13 years as Azure Data Engineer, want to move to AI
+Engineering, currently ~4500/month, want more, also show me high-paying
+jobs in my existing skill set") contains real signal beyond tone — it can
+imply a second search intent (e.g. Azure/Data Engineer roles) distinct
+from the literal `role` field. Rather than parsing it into new structured
+fields (rejected — same ambiguity reasoning as the original schema
+decision) or leaving it as inert flavor text, the Orchestrator LLM node
+reads `additional_context` (not just `role`) when deciding
+`expanded_keywords`, AND writes its own interpretation to a new state
+field:
+```python
+class OrchestratorState(TypedDict):
+    ...
+    context_signals: str   # orchestrator's own read of additional_context —
+                            # short interpretation (motivation, implied
+                            # search intent, tone instructions for Dreamer)
+                            # passed to both Score and Dreamer so they share
+                            # one grounded understanding instead of each
+                            # re-interpreting the raw paragraph independently
+```
+This keeps expansion as one coherent LLM-driven mechanism (reusing the
+existing proactive-expansion logic) instead of a second separate one, and
+gives LangSmith traces/evals something concrete to inspect ("did the
+orchestrator correctly read the salary-motivation signal") instead of an
+opaque raw paragraph.
+
+**No RAG needed**: resume text (~1-2 pages) + preferences + job_listings
+(tens of jobs after keyword filtering, not thousands) all fit comfortably
+in a single LLM context window. Score/Dreamer prompts use plain context
+stuffing (concatenate resume_text + preferences + context_signals +
+job_listings directly), not embeddings/vector retrieval — RAG would only
+become relevant if job history grew to thousands of entries via long-term
+memory (not a v1 concern). If `job_listings` ever gets large, pre-filter
+by simple keyword/tag overlap before scoring (cost/latency control, not
+retrieval).
+
+**LLM call mapping** (3 LLM nodes total per run):
+- `parse_resume` — plain code (pypdf), NOT an LLM call
+- Orchestrator — LLM call (reads preferences + resume_text +
+  additional_context, decides expanded_keywords + context_signals, calls
+  `search_jobs` tool via `agent_tool` pattern)
+- Score Agent — LLM call (parallel w/ Dreamer)
+- Dreamer Agent — LLM call (parallel w/ Score)
+- Merge — plain code, NOT an LLM call (Score/Dreamer write disjoint state
+  keys, so merge is just object assembly, no synthesis needed)
+- Optional `summarize` node (new, after merge) — cheap/small model call,
+  reads the already-merged structured result (+ memory, see below) to
+  write a short narrative wrap-up. Kept as a separate node from `merge`
+  specifically so `merge` stays deterministic.
+
+**Memory layer — two distinct layers, don't conflate them**:
+1. *Session-level (build now)*: LangGraph checkpointer (`MemorySaver`/
+   `SqliteSaver`) snapshotting `OrchestratorState` per `thread_id` — purely
+   for within-run resumability (e.g. Dreamer fails, don't re-run
+   Orchestrator+Score). No new schema; just wraps existing state.
+2. *Cross-session (`memory.py`, SQLite on the Hetzner VM)* — powers the
+   `summarize` node's dedup/trend narrative. Schema:
+   ```
+   runs
+   ├── run_id (PK)
+   ├── user_id          -- hardcoded "kushagra" for now (single-user tool),
+   │                        but present in schema so multi-user needs no
+   │                        migration later, just an identity source in
+   │                        the UI (e.g. a name field, no real auth needed)
+   ├── timestamp
+   ├── resume_hash       -- detect actual resume changes between runs
+   ├── preferences_json
+
+   scored_jobs
+   ├── run_id (FK)
+   ├── job_id            -- RemoteOK's own id, for cross-run dedup
+   ├── title, company
+   ├── category           -- "realistic" | "stretch"
+   ├── fit_score
+   ├── reasoning
+   ├── gap_suggestion
+   ```
+   All queries scoped `WHERE user_id = ...` even though it's one hardcoded
+   value today. Enables: dedup ("already seen this job"), trend ("your fit
+   score for this job/category moved since last run, esp. after a resume
+   change"). Treat fuzzy "did you close this specific gap" comparison
+   (matching this run's reasoning against last run's stored
+   `gap_suggestion` text) as a stretch feature, not v1 — build the tables
+   and basic dedup/trend queries first, revisit once a few real runs of
+   data exist to test against.
