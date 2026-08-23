@@ -37,7 +37,7 @@ Agent should come back with something like:
 - Job Y — 55% fit — good backend match but they want RAG/vector DB
   experience I don't have listed on resume.
 
-## Current state (updated 2026-08-21)
+## Current state (updated 2026-08-23)
 `job_matcher/schemas.py` is done — `JobListing`, `Preferences`, `ScoredJob`
 pydantic models, all reviewed. Confirmed against real RemoteOK API output
 (see "RemoteOK API — confirmed response shape" below). `fit_score` is
@@ -47,17 +47,40 @@ scores. (Earlier notes below describing `data.py`/`tools.py`/
 `graph_version.py`/`functional_version.py` as "already built" refer to a
 prior prototype, not code present in this repo.)
 
+`job_matcher/state.py` — `OrchestratorState` (`TypedDict`), matches the
+confirmed schema below exactly (preferences, resume_text, job_listings,
+expanded_keywords, context_signals, realistic_matches, stretch_matches).
+
+`job_matcher/graph.py` — graph skeleton wired and working:
+`START → orchestrator → (score_agent ‖ dreamer_agent) → merge → END`,
+fan-out/fan-in confirmed correct (disjoint-key writes merge with no
+reducer needed). All four nodes are still stubs — each returns hardcoded
+empty values for its output keys, no real LLM/tool logic yet.
+
+`job_matcher/test_graph.py` — manual smoke test, `python -m
+job_matcher.test_graph` (or `.venv/bin/python -m job_matcher.test_graph`
+without activating). Builds a dummy `Preferences` + dummy `resume_text`,
+calls `app.invoke(...)`, prints the final merged state. Confirmed working
+2026-08-23 — full stub state came back correctly merged. This is the fast
+feedback loop for wiring/logic changes going forward, no Streamlit or LLM
+calls needed until `orchestrator` has real logic.
+
+`.venv` exists in the repo root with `langgraph` etc. installed (per
+`requirements.txt`, added 2026-08-23 — `langgraph`, `langchain-anthropic`,
+`langsmith`, `streamlit`, `pypdf`, `requests`, `python-dotenv`, unpinned).
+
 **Collaboration style**: I'm writing the implementation myself. Claude's
 role here is to guide — explain concepts, propose structure, review code
 I write, flag issues — not to write the agent code wholesale. I'm using
 this project to learn LangGraph properly, not just to end up with a
 working tool.
 
-**Next step**: `OrchestratorState` (`TypedDict`) + start of the LangGraph
-graph itself — wraps `Preferences`, `resume_text: str`,
-`job_listings: list[JobListing]`, `expanded_keywords`, `context_signals`,
-`realistic_matches`/`stretch_matches: list[ScoredJob]` (see full shape in
-"Confirmed schema and flow" section below). Not started yet.
+**Next step**: replace the `orchestrator` stub in `graph.py` with real
+logic — read `preferences` + `resume_text`, decide `expanded_keywords`
+(adjacent-title expansion) and `context_signals` (interpretation of
+`additional_context`), call `search_jobs` against RemoteOK once. Score
+and Dreamer stay stubs until Orchestrator produces real `job_listings` to
+feed them. Not started yet.
 
 ## RemoteOK API — confirmed response shape (checked 2026-08-21)
 Pulled via `curl -s https://remoteok.com/api | python3 -m json.tool`.
