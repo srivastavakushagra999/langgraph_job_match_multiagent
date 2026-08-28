@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+job_matcher/data/resume.pdf
+*.sqlite
+*.db
+.env
