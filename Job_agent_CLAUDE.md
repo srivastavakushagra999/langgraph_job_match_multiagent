@@ -82,6 +82,131 @@ logic — read `preferences` + `resume_text`, decide `expanded_keywords`
 and Dreamer stay stubs until Orchestrator produces real `job_listings` to
 feed them. Not started yet.
 
+## Design session 2026-08-28 — job source pivot: RemoteOK → Adzuna
+
+**Why the switch**: RemoteOK has no server-side keyword search (must
+fetch the entire feed and filter client-side) and its feed is noisy
+(hotel/retail jobs mixed into "remote" listings — see confirmed shape
+notes below, still accurate for the raw feed itself even though it's no
+longer the chosen source). Explored alternatives that support real
+server-side search:
+- **Jobicy** (`jobicy.com/api/v2/remote-jobs?tag=...`) — free, no auth,
+  supports comma-separated OR search across multiple tags/titles in one
+  call. Rejected: confirmed via live test that its API returns **no
+  salary field at all**, ever (not `null`, just absent from every job
+  object) — a dealbreaker since `Preferences.salary_min` is a first-class
+  field Score/Dreamer need to reason about.
+- **Arbeitnow** (`arbeitnow.com/api/job-board-api`) — free, no auth, but
+  `?search=` param is a no-op (confirmed live — returns the same generic
+  page regardless of query) and no salary field either.
+- **The Muse** (`themuse.com/api/public/jobs`) — `?category=` filtering
+  works, but no salary field in the job object.
+- **Adzuna** (`api.adzuna.com/v1/api/jobs/{country}/search/1`) — chosen.
+  Requires free developer signup (`app_id`+`app_key`, no cost, just an
+  extra step — registration form is generic/shared with job-board
+  partners, personal/hobby use is fine). Confirmed via live testing:
+  real keyword search AND real (if sometimes-missing) salary data in the
+  same source — the only option found that has both.
+
+**Adzuna keyword search — confirmed behavior (live-tested 2026-08-28)**:
+- `what=` (plain): AND-of-individual-words, words don't need to be
+  adjacent or in order. Single keyword works well (e.g. `what=ai
+  engineer` correctly matches "AI Engineer", "AI Platform Engineer", "AI
+  Solutions Engineer" etc.). **Breaks with 2+ keywords combined in one
+  `what=` string** — demands all words from all keywords appear
+  together, returns 0 results.
+- `what_or=` with underscore-joined phrases (e.g. `what_or=ai_engineer
+  mlops_engineer`) does proper OR-across-titles, but requires exact
+  phrase adjacency — silently misses natural variants like "AI Platform
+  Engineer" (a word wedged between "AI" and "Engineer" breaks the phrase
+  match). Confirmed via live diff: this excludes exactly the kind of
+  adjacent-title matches this project's proactive-search design wants to
+  catch — rejected for that reason.
+- **Locked approach**: call `search_jobs` once per keyword in
+  `expanded_keywords` using plain `what=`, merge + dedupe results
+  client-side by job `id`. More API calls than a single `what_or=` call,
+  but correctly catches title variants (better recall), which matters
+  more here than call count (keyword lists are short, 3-5 items).
+- **No structured remote/eligibility field** — checked all 29 Adzuna
+  categories, none relate to remote work; `location` is just a
+  city/region/country object. Remote-ness (and region-restriction, e.g.
+  "Remote (from Europe)" vs "100% Remote Worldwide") only shows up as
+  free text sometimes in the title, sometimes literally inside
+  `location.display_name`. **Locked decision: don't hard-filter remote
+  eligibility in `search_jobs` — pass raw `location`/`title`/description`
+  text through in `JobListing`, let Score Agent's LLM reasoning handle
+  eligibility interpretation**, consistent with the "reason about fit,
+  don't just keyword-match" philosophy elsewhere in this doc.
+- **Country is a required path segment, not a query param** — Adzuna
+  supports exactly 19 countries (`at, au, be, br, ca, ch, de, es, fr, gb,
+  in, it, mx, nl, nz, pl, sg, us, za`), no worldwide/countryless option;
+  an unsupported/missing code 404s with `UNSUPPORTED_COUNTRY`. **Locked
+  decision: change the Streamlit `base_location` field from free text to
+  a dropdown restricted to these 19 countries** (not yet implemented —
+  `app.py` doesn't exist yet), so the backend's
+  `COUNTRY_CODE_MAP`/`_map_country_code` lookup can never receive an
+  unsupported value. Rejected letting the orchestrator LLM infer the
+  country code — this is a deterministic lookup problem with one correct
+  answer, not a judgment call worth spending an LLM call on, and an LLM
+  could plausibly hallucinate a code outside the valid 19.
+- **Salary shape**: `salary_min`/`salary_max` present as real numbers on
+  some listings, `None` on others (same "sometimes missing" pattern as
+  RemoteOK, not Jobicy's "always missing"). Also has
+  `salary_is_predicted` (0 = from the actual posting, 1 = Adzuna's ML
+  estimate) — not yet wired into `JobListing`/`ScoredJob`, worth adding
+  so Score/Dreamer can distinguish posted vs. estimated salary. Saw one
+  clearly-bad row (`salary_min: 600, salary_max: 1320` — not a
+  believable annual figure, likely an unnormalized daily/monthly rate in
+  Adzuna's raw feed) — no filter for this yet, worth a sanity-check
+  threshold later.
+
+**Built this session** (`job_matcher/tools.py`):
+- `_fetch_adzuna(keyword, country_code)` — retry x3 with `[1,2,4]`s
+  backoff, but only for transient failures (`ConnectionError`, `Timeout`,
+  5xx). 4xx errors (e.g. bad country code, bad API key) raise immediately
+  with Adzuna's own `display` error message surfaced in the exception —
+  retrying a permanent client error wastes time since it'll never
+  succeed.
+- `search_jobs(keywords, country_code)` — loops keywords, calls
+  `_fetch_adzuna` per keyword, converts + dedupes by job id.
+- `_to_job_listing(item)` — raw Adzuna dict → `JobListing`. Uses `.get()`
+  with fallbacks (not raw indexing) since Adzuna doesn't guarantee every
+  field; `search_jobs` also wraps the conversion in
+  `try/except (KeyError, AttributeError, TypeError): continue` so one
+  malformed record doesn't crash the whole batch.
+- `_strip_html(text)` — regex tag stripping for Adzuna's HTML-laden
+  `description` field.
+- `COUNTRY_CODE_MAP` + `_map_country_code(base_location)` — dict lookup,
+  keyed on the exact country display strings the future dropdown will
+  produce.
+- **Known cleanup still pending** (deprioritized this session, not
+  urgent): `JobListing` import missing from `tools.py` (will `NameError`
+  as soon as it's actually run); `ADZUNA_APP_ID`/`ADZUNA_APP_KEY` are
+  read from `os.environ` at module import time, meaning anything
+  importing `tools.py` before `.env` is loaded will crash — should be
+  lazy-loaded inside `_fetch_adzuna` instead; malformed-record warning
+  uses bare `print`, should be `logging` once observability work starts;
+  minor PEP8 blank-line spacing inconsistencies.
+- Added a `.gitignore` (didn't exist before this session — `.venv/`,
+  `__pycache__/`, `.env`, `job_matcher/data/resume.pdf`, `*.sqlite`,
+  `*.db`).
+
+**`job_matcher/resume.py`** — started, not finished: `parse_resume(pdf_path)`
+using `pypdf`, extracts text per page (`page.extract_text() or ""` to
+survive `None` on a page with no extractable text layer — no OCR, per
+locked decision, so a scanned-image resume would silently return empty
+text for that page rather than erroring). Still open: does the
+"uploaded PDF vs. default `job_matcher/data/resume.pdf` fallback" branch
+live inside `parse_resume` itself, or in `app.py` with `parse_resume`
+staying a plain path-in/text-out function? Not decided yet.
+
+**Next step**: wire `search_jobs` into the `orchestrator` node in
+`graph.py` — the LLM call that reads `preferences` + `resume_text` +
+`additional_context`, decides `expanded_keywords` + `context_signals`,
+then calls `search_jobs(expanded_keywords, country_code)` with what it
+decided. Not started yet. `score_agent`/`dreamer_agent` remain stubs
+until `orchestrator` produces real `job_listings`.
+
 ## RemoteOK API — confirmed response shape (checked 2026-08-21)
 Pulled via `curl -s https://remoteok.com/api | python3 -m json.tool`.
 Notes that matter for the `search_jobs` tool (not written yet):
@@ -109,8 +234,10 @@ Notes that matter for the `search_jobs` tool (not written yet):
 ## Decisions locked in
 - **Resume input**: PDF upload, agent parses it (need a PDF-to-text step —
   e.g. `pypdf` or similar, keep it simple, no need for OCR)
-- **Job source**: RemoteOK public JSON API (https://remoteok.com/api) —
-  real data, no auth needed. Respect rate limits, don't hammer it in a loop.
+- **Job source**: Adzuna API (see "Job source pivot" session below,
+  2026-08-28 — supersedes the RemoteOK decision originally written here).
+  Requires a free `app_id`/`app_key` signup, stored in `.env`
+  (`ADZUNA_APP_ID`, `ADZUNA_APP_KEY`), never hardcoded.
 - **Preferences**: structured Streamlit form input, no LLM parsing needed
   for these fields (see confirmed `Preferences` schema below) — plus one
   optional free text field for anything else the form doesn't capture
