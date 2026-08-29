@@ -7,6 +7,7 @@ class OrchestratorState(TypedDict):
     # --- input ---
     preferences: Preferences
     resume_text: str
+    candidate_profile: str
 
     # --- written by Orchestrator ---
     job_listings: list[JobListing]

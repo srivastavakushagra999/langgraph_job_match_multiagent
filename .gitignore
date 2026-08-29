@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 .env
-job_matcher/data/resume.pdf
+job_matcher/data/
 *.sqlite
 *.db
 .env

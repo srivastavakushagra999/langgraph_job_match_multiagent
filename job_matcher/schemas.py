@@ -32,3 +32,18 @@ class ScoredJob(BaseModel):
     fit_score: int = Field(ge=0, le=100)
     reasoning: str
     gap_suggestion: str
+
+class OrchestratorDecision(BaseModel):
+    expanded_keywords: list[str]
+    context_signals: str
+
+
+class JobScore(BaseModel):
+    job_id: str
+    fit_score: int = Field(ge=0, le=100)
+    reasoning: str
+    gap_suggestion: str
+
+
+class ScoreAgentOutput(BaseModel):
+    scores: list[JobScore]

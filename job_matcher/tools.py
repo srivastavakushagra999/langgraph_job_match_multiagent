@@ -2,18 +2,19 @@ import re
 import time
 import requests
 import os
+from dotenv import load_dotenv
+from job_matcher.schemas import JobListing
 
-ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
-ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
 MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = [1, 2, 4]
 
 
 def _fetch_adzuna(keyword: str, country_code: str) -> list[dict]:
+    load_dotenv()
     url = f"https://api.adzuna.com/v1/api/jobs/{country_code}/search/1"
     params = {
-        "app_id": ADZUNA_APP_ID,
-        "app_key": ADZUNA_APP_KEY,
+        "app_id": os.environ["ADZUNA_APP_ID"],
+        "app_key": os.environ["ADZUNA_APP_KEY"],
         "what": keyword,
         "content-type": "application/json",
     }

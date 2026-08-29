@@ -1,5 +1,6 @@
 from job_matcher.graph import app
 from job_matcher.schemas import Preferences
+from job_matcher.resume import parse_resume
 
 
 def main() -> None:
@@ -11,8 +12,15 @@ def main() -> None:
         base_location="Netherlands",
         open_to_onsite_at_base=True,
     )
+    resume_text = parse_resume("job_matcher/data/resume.pdf")
+    with open("job_matcher/data/candidate_profile_kushagra.txt") as f:
+        candidate_profile = f.read()
 
-    result = app.invoke({"preferences": prefs, "resume_text": "dummy resume text"})
+    result = app.invoke({
+        "preferences": prefs,
+        "resume_text": resume_text,
+        "candidate_profile": candidate_profile,
+    })
     print(result)
 
 

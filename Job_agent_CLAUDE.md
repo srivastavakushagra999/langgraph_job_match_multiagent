@@ -191,21 +191,112 @@ server-side search:
   `__pycache__/`, `.env`, `job_matcher/data/resume.pdf`, `*.sqlite`,
   `*.db`).
 
-**`job_matcher/resume.py`** — started, not finished: `parse_resume(pdf_path)`
-using `pypdf`, extracts text per page (`page.extract_text() or ""` to
-survive `None` on a page with no extractable text layer — no OCR, per
-locked decision, so a scanned-image resume would silently return empty
-text for that page rather than erroring). Still open: does the
-"uploaded PDF vs. default `job_matcher/data/resume.pdf` fallback" branch
-live inside `parse_resume` itself, or in `app.py` with `parse_resume`
-staying a plain path-in/text-out function? Not decided yet.
+**`job_matcher/resume.py`** — `parse_resume(pdf_path)` using `pypdf`,
+extracts text per page (`page.extract_text() or ""` to survive `None` on
+a page with no extractable text layer — no OCR, per locked decision, so a
+scanned-image resume would silently return empty text for that page
+rather than erroring). **Locked decision (2026-08-29)**: the "uploaded
+PDF vs. default `job_matcher/data/resume.pdf` fallback" branch lives in
+`app.py`, not in `parse_resume`. `parse_resume` stays a plain
+path-in/text-out function — no knowledge of uploads or fallbacks — since
+`app.py` is the layer that already talks to Streamlit's `file_uploader`
+(which returns `None` when nothing's uploaded) and needs to know which
+source was used anyway, to show the "uploaded vs. default-on-file"
+caption. Keeps `parse_resume` easy to unit-test and reusable (e.g.
+`test_graph.py` needs plain resume text with no PDF involved at all).
 
-**Next step**: wire `search_jobs` into the `orchestrator` node in
-`graph.py` — the LLM call that reads `preferences` + `resume_text` +
-`additional_context`, decides `expanded_keywords` + `context_signals`,
-then calls `search_jobs(expanded_keywords, country_code)` with what it
-decided. Not started yet. `score_agent`/`dreamer_agent` remain stubs
-until `orchestrator` produces real `job_listings`.
+## Session 2026-08-29 (Day 5) — orchestrator, score_agent, dreamer_agent all real
+
+**All three LLM nodes are now implemented and confirmed working
+end-to-end** via `test_graph.py` against a real resume PDF
+(`job_matcher/data/resume.pdf`) and live Adzuna/Anthropic calls (no more
+stubs except `merge`, which per the confirmed flow design is plain object
+assembly, no LLM needed).
+
+**`orchestrator`**: LLM call (`claude-haiku-4-5-20251001` — lightweight
+judgment task, cheap model is fine) returns structured
+`OrchestratorDecision {expanded_keywords, context_signals}` only; country
+code mapping (`_map_country_code`, deterministic) and the actual
+`search_jobs` call are plain code, not LLM-driven — same "LLM does
+judgment, code does mechanical execution" principle used for the
+country-code decision earlier. **Locked decision**: rejected exposing
+`search_jobs` as a bindable LLM tool (`agent_tool`/tool-calling loop
+pattern) — it would make execution shape (whether/how many times the tool
+gets called) LLM-controlled instead of fixed, harder to eval/trace in
+LangSmith (variable-length trace per run vs. one fixed-shape call), and
+would reintroduce the country-code-hallucination risk since the LLM would
+have to generate `country_code` itself as a tool argument.
+
+**`score_agent`** and **`dreamer_agent`**: both use `claude-sonnet-5`
+(stronger reasoning needed here — grounding claims in actual resume
+content across up to ~39 jobs in one batched call is a heavier load than
+orchestrator's keyword-expansion task). Both return a list of `JobScore
+{job_id, fit_score, reasoning, gap_suggestion}` (schema currently named
+`ScoreAgentOutput`, reused by both agents since the shape is identical —
+worth a rename to something generic like `JobEvaluation` at some point,
+not urgent) — deliberately NOT the full `ScoredJob` with a nested
+`JobListing`, to avoid making the LLM reproduce fields like `url`/
+`description` it doesn't need to touch. Code joins `job_id` back to the
+real `JobListing` objects (from `state["job_listings"]`) to build actual
+`ScoredJob` instances; an unmatched `job_id` is silently skipped rather
+than crashing the node.
+
+**Dreamer distinctness** — confirmed via a live run, not just designed:
+Score Agent's top-rated job (fit_score 80) also appeared in Dreamer's
+stretch picks, but Dreamer scored it 68, not 80 — because Dreamer's
+system prompt explicitly requires `fit_score` to reflect *current* fit
+(usually lower than a safe match), with the upside case made in
+`reasoning`/`gap_suggestion` instead. Score and Dreamer run in parallel
+(fan-out, no shared output at runtime per the doc's own architecture), so
+this distinctness has to come from each prompt's own framing, not from
+Dreamer excluding whatever Score already picked. Dreamer's prompt also
+caps how far a stretch can go: the gap must be bridgeable by extending
+current skills (e.g. Databricks → new cloud service in the same
+ecosystem), not a from-scratch pivot into an unrelated field — even a
+high-paying job gets excluded from stretch matches if it requires
+starting from zero.
+
+**New input: `candidate_profile`** — added `candidate_profile: str` to
+`OrchestratorState`, sourced from a new gitignored file
+(`job_matcher/data/candidate_profile_kushagra.txt`) — durable info about
+the candidate (priorities, learning style) that doesn't belong in
+per-run `additional_context` (which is per-search free text) or
+`resume_text` (which is just facts/skills). This operationalizes the
+`## My background` section already written elsewhere in this doc, which
+previously wasn't actually wired into any prompt. Only `score_agent` and
+`dreamer_agent` read it (`orchestrator`'s keyword-expansion task doesn't
+need it) — Dreamer uses it most heavily, to judge what "high upside"
+means for this specific candidate. **`.gitignore` changed** from the
+single literal path `job_matcher/data/resume.pdf` to the whole
+`job_matcher/data/` directory, after almost committing a real resume PDF
+under a different filename (`Kushagra_Srivastava_sr_dataengineer_lst.pdf`)
+that the old exact-path rule didn't catch — the directory itself is
+meant for personal, gitignored inputs only.
+
+**New file: `job_matcher/prompts.py`** — all system prompts and human-
+prompt builder functions extracted out of `graph.py`, since 3 LLM nodes
+each need a sizeable prompt and inlining them would make `graph.py`
+mostly prompt text instead of graph wiring. `graph.py` now stays pure
+control-flow + the deterministic joins.
+
+**`tools.py` cleanup** (two bugs fixed this session, both previously
+flagged as "known cleanup pending"): the `JobListing` import was missing
+entirely (`from job_matcher.schemas import JobListing`); and
+`ADZUNA_APP_ID`/`ADZUNA_APP_KEY` were read from `os.environ` at module
+import time, which would crash on `import graph` (since `graph.py`
+imports `tools.py`) before `.env` was ever loaded, and would also have
+meant `test_graph.py`'s wiring smoke test needed real Adzuna credentials
+just to import the graph. Fixed by moving `load_dotenv()` + the
+`os.environ[...]` reads inside `_fetch_adzuna`, evaluated lazily only
+when a real API call actually happens.
+
+**Next step**: `merge` is the only remaining stub. Per the confirmed
+design it should be plain code (no LLM) — `realistic_matches` and
+`stretch_matches` are disjoint state keys already written by Score/
+Dreamer, so `merge` just needs to assemble/pass through the final result
+shape, no synthesis logic needed. After that: `app.py` (Streamlit UI),
+the resume upload/fallback branch, and the country-dropdown restricted to
+Adzuna's 19 supported codes are still fully unbuilt.
 
 ## RemoteOK API — confirmed response shape (checked 2026-08-21)
 Pulled via `curl -s https://remoteok.com/api | python3 -m json.tool`.
