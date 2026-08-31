@@ -355,6 +355,63 @@ that the server boots). After that, per the original architecture doc,
 remaining unbuilt pieces are observability (LangSmith env-var wiring),
 the eval suite, and the cross-session SQLite memory layer (`memory.py`).
 
+## Design session 2026-08-31 (Day 6, cont.) — roadmap: chat + unify into one graph
+
+**Discussed, not yet built** (next real milestone, bigger than a single
+session):
+
+- **Chat Q&A over existing results** — once a run finishes, let the user
+  ask follow-up questions ("why is job X only 45%?") grounded in
+  `resume_text` + `realistic_matches` + `stretch_matches`, without
+  re-running the search. Small context (same "no RAG needed" reasoning
+  as Score/Dreamer already use).
+- **Resume-improvement tool** — rejected in-place PDF editing as the
+  approach (this resume's PDF layout is multi-column/complex, and
+  rewriting text inside an existing PDF while preserving layout is
+  fragile with any tool, not a library/MCP limitation — PDF is a fixed-
+  layout format, not built for reflow-safe editing). No MCP currently
+  configured in this project either. **Locked direction instead**:
+  generate a *fresh* resume from structured content, not edit the
+  original. Prototyped with `rendercv` (pip package, YAML in -> polished
+  PDF out via typst, no LaTeX needed) — live-tested this session with a
+  sample YAML, produced a clean single-page PDF with zero manual layout
+  work. Real flow would have the LLM emit resume content as structured
+  output (reusing the `with_structured_output` pattern already used for
+  Score/Dreamer) matching RenderCV's schema, then call `rendercv render`
+  to produce the PDF — same "LLM does judgment, code does mechanical
+  execution" principle used elsewhere in this doc.
+- **Cross-session memory** (`memory.py`, SQLite, already schema-designed
+  in the 2026-08-21 session below) — needed so returning to the app can
+  default to loading the last session (skip re-searching) instead of
+  always starting fresh.
+
+**Locked architecture decision**: build the above as **one unified
+LangGraph graph**, not as ad-hoc branching logic in `app.py` calling a
+fixed pipeline. Specifically:
+- A **conditional entry point** (`START` routed via a router
+  function/node, not a plain `add_edge`) that checks whether a saved
+  session exists for the user and routes to either a `load_session` node
+  or straight into the existing `orchestrator` pipeline.
+- **A LangGraph checkpointer** (`SqliteSaver`, per the existing
+  session-memory plan) keyed by `thread_id`, so each chat turn is its own
+  `invoke()` call (fits Streamlit's rerun-per-interaction model naturally)
+  but state persists across turns without `app.py` manually threading it
+  through.
+
+**Why this over the simpler "app.py orchestrates, graph stays a fixed
+pipeline" split** considered earlier in this session: keeps every
+LLM/tool call across the whole user session traceable in one place in
+LangSmith (the project's own explicit observability goal), and is the
+first use of LangGraph's human-in-the-loop / multi-turn pattern in this
+project — deliberately chosen partly *because* it's a pattern not yet
+explored here, consistent with this project's "learn the framework
+properly" goal, not just "ship a working tool."
+
+**Not started** — this is a real architecture milestone (new router node,
+new chat node, checkpointer wiring, `OrchestratorState` changes to carry
+chat history), deliberately deferred to a dedicated future session rather
+than bolted on at the end of Day 6.
+
 ## RemoteOK API — confirmed response shape (checked 2026-08-21)
 Pulled via `curl -s https://remoteok.com/api | python3 -m json.tool`.
 Notes that matter for the `search_jobs` tool (not written yet):
