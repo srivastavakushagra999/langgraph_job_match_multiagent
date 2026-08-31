@@ -298,6 +298,63 @@ shape, no synthesis logic needed. After that: `app.py` (Streamlit UI),
 the resume upload/fallback branch, and the country-dropdown restricted to
 Adzuna's 19 supported codes are still fully unbuilt.
 
+## Session 2026-08-31 (Day 6) — merge implemented, app.py built
+
+**`merge`** (`job_matcher/graph.py`) — no longer a stub. Plain code, no LLM,
+per the locked design: sorts `state["realistic_matches"]` and
+`state["stretch_matches"]` each by `fit_score` descending
+(`sorted(..., key=lambda scored_job: scored_job.fit_score, reverse=True)`)
+and returns both. Confirmed via `test_graph.py` (real Adzuna + Anthropic
+calls): 83 raw listings across 4 expanded keywords → 39 realistic matches
+(scores `85→...→20`, correctly descending) + 5 stretch matches (scores
+`48→...→38`, correctly descending). All 5 graph nodes
+(orchestrator/score_agent/dreamer_agent/merge, `START`/fan-out/fan-in/`END`)
+are now real, end-to-end confirmed working.
+
+**`app.py`** (Streamlit UI, new file, repo root) — **built by Claude
+directly this session**, a deliberate one-off exception to the
+"user writes the implementation" collaboration style: I said I'm not
+keen to build frontend myself, so Claude owns `app.py` specifically.
+Backend (`job_matcher/`) stays mine to write; this doesn't change that.
+- Form fields: `role`, `remote` checkbox, `salary_min` + `currency`
+  (EUR/USD/GBP dropdown), `base_location` — dropdown built from
+  `tools.COUNTRY_CODE_MAP` keys directly (the locked "restrict to
+  Adzuna's 19 supported countries" decision — can't drift out of sync
+  since it reads the same dict `_map_country_code` uses),
+  `open_to_onsite_at_base` checkbox, optional free-text
+  `additional_context`, PDF resume uploader.
+- **Resume fallback implemented**: uploaded PDF wins if present
+  (written to a temp file, parsed, temp file cleaned up in a `finally`);
+  otherwise falls back to `job_matcher/data/resume.pdf`, erroring clearly
+  if neither exists. A caption always shows which source was used
+  (uploaded vs. default-on-file), per the locked "never silently score
+  against a stale resume" decision from the 2026-08-21 session.
+- `candidate_profile` read from `job_matcher/data/candidate_profile_kushagra.txt`
+  directly in `app.py` (not user-facing input — it's the durable
+  candidate-background file, same as `test_graph.py` already does).
+- Results rendered as two `st.tabs`: "Realistic Matches" and "Stretch
+  Goals," each as cards (title, company, fit score, location, salary,
+  reasoning, gap/roadmap suggestion, listing link) via one shared
+  `render_job_card` helper — reused across both tabs since `ScoredJob`'s
+  shape is identical for Score and Dreamer output.
+- `st.spinner` during the graph run (multiple LLM calls, can take
+  10-30+s), `job_matcher_app.invoke(...)` wrapped in try/except so a
+  failure shows `st.error` instead of a raw traceback.
+- Added `.streamlit/config.toml` with `server.address = "0.0.0.0"` for
+  the Hetzner VM constraint; port left at Streamlit's default,
+  overridable via `--server.port`/`STREAMLIT_SERVER_PORT` without
+  hardcoding, per the "configurable port" constraint.
+- **Verified**: boots clean, serves HTTP 200
+  (`.venv/bin/streamlit run app.py`). **Not yet verified**: a full
+  click-through with real form input — I only confirmed the server
+  starts, not that a real match run renders correctly in the browser.
+
+**Next step**: click through `app.py` in the browser with real input to
+confirm the results UI actually renders correctly end-to-end (not just
+that the server boots). After that, per the original architecture doc,
+remaining unbuilt pieces are observability (LangSmith env-var wiring),
+the eval suite, and the cross-session SQLite memory layer (`memory.py`).
+
 ## RemoteOK API — confirmed response shape (checked 2026-08-21)
 Pulled via `curl -s https://remoteok.com/api | python3 -m json.tool`.
 Notes that matter for the `search_jobs` tool (not written yet):

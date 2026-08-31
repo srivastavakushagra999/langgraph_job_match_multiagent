@@ -87,3 +87,9 @@ def _map_country_code(base_location: str) -> str:
     if base_location not in COUNTRY_CODE_MAP:
         raise ValueError(f"No Adzuna country code mapping for base_location={base_location!r}")
     return COUNTRY_CODE_MAP[base_location]
+
+def filter_top_jobs(job_listings, keywords, limit=30):
+    def relevance(job):
+        text = (job.position + " " + " ".join(job.tags)).lower()
+        return sum(1 for kw in keywords for word in kw.lower().split() if word in text)
+    return sorted(job_listings, key=relevance, reverse=True)[:limit]

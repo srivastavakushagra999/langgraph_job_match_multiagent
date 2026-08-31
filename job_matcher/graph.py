@@ -3,7 +3,7 @@ from job_matcher.state import OrchestratorState
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from job_matcher.schemas import Preferences, OrchestratorDecision, ScoreAgentOutput, ScoredJob
-from job_matcher.tools import search_jobs, _map_country_code
+from job_matcher.tools import search_jobs, _map_country_code, filter_top_jobs
 from job_matcher.prompts import (
     ORCHESTRATOR_SYSTEM_PROMPT,
     build_orchestrator_human_prompt,
@@ -12,6 +12,7 @@ from job_matcher.prompts import (
     DREAMER_AGENT_SYSTEM_PROMPT,
     build_dreamer_agent_human_prompt,
 )
+
 # --- node stubs — replace each body with real logic one at a time ---
 
 def orchestrator(state: OrchestratorState) -> dict:
@@ -28,6 +29,7 @@ def orchestrator(state: OrchestratorState) -> dict:
 
     country_code = _map_country_code(prefs.base_location)
     jobs = search_jobs(decision.expanded_keywords, country_code)
+    jobs = filter_top_jobs(jobs, decision.expanded_keywords, limit=30)
 
     return {
         "job_listings": jobs,
@@ -99,7 +101,16 @@ def dreamer_agent(state: OrchestratorState) -> dict:
 
 
 def merge(state: OrchestratorState) -> dict:
-    return {}
+    realistic_matches = sorted(
+        state["realistic_matches"], key=lambda scored_job: scored_job.fit_score, reverse=True
+    )
+    stretch_matches = sorted(
+        state["stretch_matches"], key=lambda scored_job: scored_job.fit_score, reverse=True
+    )
+    return {
+        "realistic_matches": realistic_matches,
+        "stretch_matches": stretch_matches,
+    }
 
 
 # --- wiring ---
