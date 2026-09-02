@@ -917,3 +917,101 @@ retrieval).
    `gap_suggestion` text) as a stretch feature, not v1 — build the tables
    and basic dedup/trend queries first, revisit once a few real runs of
    data exist to test against.
+
+## Design session 2026-09-02 (Day 7) — chat history reducer, rolling summary, ReAct-scoped chat loop
+
+Conceptual deep-dive on the chat milestone (locked 2026-08-31, not started)
+before writing any code — reducer semantics, summarization mechanics, and
+a refinement of the ReAct decision specifically for the chat branch.
+
+**`chat_history` needs a reducer; `realistic_matches`/`stretch_matches`
+don't.** Plain `TypedDict` fields default to overwrite-on-return — fine
+for `realistic_matches`/`stretch_matches` since each is written by exactly
+one node, exactly once, per run (no accumulation needed, replace and
+append produce the same result). `chat_history` is different: the same
+key gets written every turn, and each turn's node only knows about *that
+turn's* new messages — under overwrite semantics, turn 2's return would
+wipe turn 1 from state entirely. Fix: `chat_history: Annotated[list[AnyMessage],
+add_messages]` (from `langgraph.graph.message`) — the reducer appends new
+messages onto the existing list instead of replacing it, and also
+understands `RemoveMessage(id=...)` for explicit deletion (used below).
+
+**Rolling summary locked, to bound `chat_history` growth without losing
+old context**: this is a named/standard LangGraph pattern ("summarizing
+conversation history"), not a custom invention.
+- New field `chat_summary: str` — plain overwrite (single writer:
+  `summarize_node`).
+- **Numbers locked**: `KEEP_LAST_N = 30`, `SUMMARY_TRIGGER = 70` (gap of
+  40). Once `len(chat_history) > 70`, a conditional edge routes to
+  `summarize_node`, which folds the oldest ~40 messages into the existing
+  `chat_summary` (extends it, doesn't restart from scratch) and prunes
+  them from `chat_history` via `RemoveMessage`, back down to 30. Sawtooth
+  growth pattern (30 → 70 → prune to 30 → repeat), recurring roughly every
+  40 new messages (~20 turns) — deliberately avoided setting `KEEP ==
+  TRIGGER`, which would cause summarization to fire on *every* turn once
+  past threshold (permanently doubling LLM calls) rather than
+  periodically.
+- Runs on Haiku (cheap-model tier, same reasoning as `orchestrator`) —
+  compression is lower-stakes than Score/Dreamer's grounding task.
+- The conditional-edge check itself (`len(chat_history) > 70`) is free —
+  pure Python, no LLM call — so the extra cost only lands on the ~1-in-20
+  turns that actually trigger summarization, not every turn.
+
+**Prompt assembly per chat turn**:
+```
+system_prompt + chat_summary + trim_messages(chat_history, max_tokens=~30-msgs-worth) + user_question
+```
+`trim_messages` (token-based, via a token counter) sits on top of the
+already-pruned `chat_history` mostly as a safety net — since storage is
+already capped at 30 messages by the summarizer, token-trimming rarely
+has much left to cut, except the edge case where those 30 stored messages
+happen to be unusually long individually. Confirmed no dollar cost either
+way (trimming isn't a generation call); passing the model itself as
+`token_counter` typically hits Anthropic's free count-tokens endpoint
+(exact count, extra network round-trip, no charge) vs. a local/approximate
+counter (zero network calls, less precise).
+
+**Execution model clarified — matters for the router design below**:
+every `.invoke()`/`.stream()` call starts fresh from an entry point
+(`START`); LangGraph is not a persistent resident loop between UI
+messages (that's `interrupt()`'s job — pausing/resuming *across* separate
+calls at an exact interior point, a different mechanism, not used here).
+But "fresh execution" does not mean "all nodes re-run" — only nodes on
+the path actually taken by conditional edges execute. This is why a
+router is needed at `START`: without one, a chat question would
+re-traverse the full `orchestrator → score/dreamer → merge` pipeline
+(re-hitting Adzuna, re-scoring everything) just to answer a follow-up
+question, which is wasted work, not a LangGraph limitation.
+
+**Refined (not reversed) the 2026-08-31 "no open ReAct for the whole
+system" decision.** That decision was about the *heavy pipeline*
+specifically — `orchestrator`/`score_agent`/`dreamer_agent` and
+deterministic infra steps (country-code mapping, job filtering) shouldn't
+be left to LLM judgment as a tool-call decision, since they always run in
+the same fixed order with no real conditionality. That reasoning does
+**not** extend to the chat branch, where a single message can bundle
+multiple genuinely conditional asks (e.g. "improve my resume and what was
+the improvement compared to earlier" = an action + a `query_past_runs`
+lookup in one turn) — pre-enumerating every combination at the router
+level fights the problem instead of solving it. **Locked**: `START →
+router` stays a bounded single choice (`"new search"` vs `"chat"`, same
+as before), but the `"chat"` branch itself becomes a small **cyclic
+ReAct loop** (`llm_node ⇄ tool_node`, looping via a conditional edge
+until the model has what it needs) over a **known, fixed toolkit** —
+`query_past_runs`, `get_job_by_id`, and (once designed) `improve_resume`.
+Still bounded in the sense that matters for eval/tracing: the complete
+universe of callable tools is known ahead of time, even though call
+count/order per turn isn't fixed — a materially narrower risk surface
+than an open-ended loop over the whole pipeline.
+
+**`improve_resume` flagged as a new, undesigned tool** — reuses the
+`rendercv` direction already validated (2026-08-31 session: YAML →
+structured-output-driven PDF via typst), but exposing it as a callable
+tool inside the chat ReAct loop, and its actual interface/schema, is new
+scope not yet specified.
+
+**Not started** — still the same real architecture milestone as the prior
+two sessions flagged (router node, chat ReAct loop, checkpointer wiring,
+`OrchestratorState` changes for `chat_history`/`chat_summary`/`run_id`,
+`query_past_runs`/`get_job_by_id`/`improve_resume` tools) — conceptual
+design now considerably more detailed, but no code written yet.
