@@ -345,15 +345,178 @@ Backend (`job_matcher/`) stays mine to write; this doesn't change that.
   overridable via `--server.port`/`STREAMLIT_SERVER_PORT` without
   hardcoding, per the "configurable port" constraint.
 - **Verified**: boots clean, serves HTTP 200
-  (`.venv/bin/streamlit run app.py`). **Not yet verified**: a full
-  click-through with real form input — I only confirmed the server
-  starts, not that a real match run renders correctly in the browser.
+  (`.venv/bin/streamlit run app.py`).
 
-**Next step**: click through `app.py` in the browser with real input to
-confirm the results UI actually renders correctly end-to-end (not just
-that the server boots). After that, per the original architecture doc,
-remaining unbuilt pieces are observability (LangSmith env-var wiring),
-the eval suite, and the cross-session SQLite memory layer (`memory.py`).
+**Bug found via real browser click-through, fixed same session**:
+`score_agent` crashed on a real run — `1 validation error for
+ScoreAgentOutput scores: Input should be a valid list` — the model's tool
+output came back with the whole JSON blob nested as a string value inside
+the `scores` field instead of a proper list. Root cause wasn't
+`max_tokens` (confirmed `ChatAnthropic` defaults to 128k, plenty of
+headroom) — it was sheer request size: `orchestrator` had returned **83**
+raw job listings (4 expanded keywords × Adzuna results), and
+`score_agent`'s prompt demands scoring *every* listing in one structured-
+output call. Even the prior *successful* run had silently scored only 39
+of 83, ignoring "do not skip any" — so this was already unreliable at
+that volume, just failing loudly instead of quietly.
+
+**Fix**: added `filter_top_jobs(job_listings, keywords, limit=30)` to
+`tools.py` — plain code, no LLM, ranks jobs by how many
+`expanded_keywords` words appear in the job's `position`/`tags` (case-
+insensitive), sorts descending, takes the top 30. Wired into
+`orchestrator` in `graph.py` right after `search_jobs`, before the
+`return`. Re-ran `test_graph.py`: `job_listings` confirmed capped at
+exactly 30, 35 scores returned total (realistic + stretch), no crash.
+This is the pre-filtering escape hatch the 2026-08-20 design session had
+already flagged as a future need ("if job_listings ever gets large,
+pre-filter by simple keyword/tag overlap before scoring") — turned out to
+be needed sooner than expected.
+
+**`app.py` upgraded to stream node-by-node progress**: replaced
+`job_matcher_app.invoke(...)` + `st.spinner` with
+`job_matcher_app.stream(state, stream_mode="updates")` inside an
+`st.status(..., expanded=True)` block. Each node's output arrives as its
+own chunk (`{node_name: partial_state}`); the UI writes a `✅ <label>`
+line as each one lands (orchestrator → score_agent/dreamer_agent →
+merge) and manually accumulates `state.update(node_output)` per chunk
+since there's no separate final-state return in streaming mode. Verified
+booting cleanly after the change.
+
+**Committed and pushed**: `b6ef6df` "Day 6: UI and merge in orchestrator"
+(`Job_agent_CLAUDE.md`, `app.py`, `.streamlit/config.toml`,
+`job_matcher/graph.py`, `job_matcher/tools.py` — the `.agents`/`.claude`
+local tool-config directories deliberately left out of the commit).
+
+**Next step**: per the original architecture doc, remaining unbuilt
+pieces are observability (LangSmith env-var wiring) and the eval suite —
+superseded in priority, though, by the chat + memory architecture design
+below, which is now the locked next milestone.
+
+## Design session 2026-08-31 (Day 6, cont. 2) — chat architecture: memory layers, thread/run split, comparison mechanics
+
+Extended design conversation following the roadmap sketch above, working
+through the mechanics of the unified chat graph in more depth before any
+of it gets built.
+
+**Resume-editing tool, narrowed further**: asked whether an existing MCP
+server could shortcut the PDF-editing problem — checked, none configured
+in this project (`.mcp.json` doesn't exist; only unrelated/unauthenticated
+Canva/Figma/Google Drive connectors available globally). Concluded MCP
+wouldn't help anyway: the difficulty isn't tooling, it's that PDF is a
+fixed-layout format not designed for safe reflow-editing — true for any
+tool, not a library gap. Confirms the earlier "generate fresh, don't edit
+original" decision. `rendercv` (pip package, YAML → polished PDF via
+typst) was live-tested in this session in an isolated scratchpad venv —
+produced a clean one-page PDF from a hand-written sample YAML with zero
+manual layout work, validating it as the render target for this feature.
+
+**Locked: unify chat + search into one LangGraph graph, not app.py-level
+branching.** Rejected going further into a fully open ReAct/tool-calling
+loop for the *whole* system (LLM freely decides what to call, in what
+order) — same reasoning as the earlier locked decision to keep
+`search_jobs` out of an `agent_tool` pattern: variable execution shape is
+harder to eval/trace in LangSmith, and deterministic steps (country-code
+mapping, job filtering, sorting) shouldn't be delegated to LLM judgment,
+just a new failure-mode surface for no benefit. **Middle ground kept**:
+the heavy pipeline (`orchestrator → score/dreamer → merge`) stays a fixed,
+deterministic graph exactly as built; only the new `chat` node gets
+LLM-driven routing, and even there it's a *bounded* choice between a
+small fixed set of next steps, not an open tool loop.
+
+**Two distinct memory mechanisms — don't conflate them**:
+1. **LangGraph checkpointer** (`SqliteSaver`, keyed by `thread_id`) — full
+   `OrchestratorState` snapshotted automatically after every node. This is
+   what actually powers "resume where I left off": `load_session` just
+   needs the right `thread_id`, no manual state reconstruction. File-
+   based, persists across restarts, but has **no built-in expiry** — grows
+   unbounded until something explicitly prunes old threads. Not a v1
+   concern (personal tool, small data) but flagged as a future cleanup
+   TODO, same shape as the "unbounded `st.cache_data` growth" caution
+   already known from Streamlit performance guidance.
+2. **`memory.py` SQLite (`runs`/`scored_jobs`, schema already designed in
+   the 2026-08-21 session)** — lightweight, long-term, cross-run
+   *analytical* history: dedup ("seen this job before") and trend
+   ("how did my fit score for X change"). Explicitly **not** what powers
+   session resumption, and not queried at normal Q&A answer-time.
+
+**What actually feeds the Q&A LLM call**: `resume_text` +
+`realistic_matches`/`stretch_matches` (full `ScoredJob`, including the
+nested `JobListing` — so location/salary/description questions are
+answerable with zero extra fetch) + `candidate_profile` + recent chat
+turns — plain context stuffing, same "no RAG needed" principle already
+used for Score/Dreamer, pulled from checkpointed state, not from SQLite.
+
+**LLM-context growth over a long chat — real concern, mitigated, not a
+blocker**: every turn is stateless and resends full history, so cost/
+latency grow with conversation length. Three levers, no new pattern
+needed:
+- **Prompt caching** (`cache_control: {"type": "ephemeral"}`) — biggest
+  win, since `resume_text`/results are static within a session; only
+  ~10% cost on cache hits instead of full price every turn.
+- **History windowing** (send only last N turns) as a safety net if a
+  chat genuinely runs long — not expected to matter much for a personal
+  tool, but cheap insurance.
+- **Cheaper model for the chat node** — `claude-haiku-4-5` (same tier
+  already used for `orchestrator`) is plausible here since Q&A judgment
+  is lighter than Score/Dreamer's grounding task.
+
+**Locked: one `thread_id` per user, not per search-run.** Originally
+proposed `thread_id == run_id` (new thread per search); reversed after
+weighing it against wanting the chat to feel like one continuous
+assistant relationship across many searches, not a reset each time.
+Consequence worth remembering: **`job_listings`/`realistic_matches`/
+`stretch_matches` are overwrite fields in `OrchestratorState`, not
+accumulators** — a second search inside the same thread replaces them, so
+chat can't recover a *previous* run's job data from live graph state once
+a newer run has happened. This is exactly why `memory.py`'s per-run
+SQLite rows still matter even with one continuous thread — checkpointer
+state answers "what's true right now," SQLite answers "what was true in
+an earlier run."
+
+**Job-reference disambiguation across searches** (e.g. "that Amsterdam
+job from before" after a second search has already overwritten state):
+resolved as a language-grounding problem, not a mechanical timestamp
+check — normal multi-turn reference resolution, provided each job's
+`job_id` stays attached to its mention in the actual message *content*
+sent to the LLM (not just pretty display text the UI shows), so the model
+can recover the exact id from its own earlier turns rather than fuzzy-
+matching on title/company. A lookup tool (`get_job_by_id` against
+`scored_jobs`) backs this up for fetching authoritative/fresh detail once
+an id is known. A plain marker message on each new search ("🔍 New search
+run — keywords: [...]") adds a natural boundary in the transcript — kept
+as an ordinary message, not a mid-conversation `system`-role turn, since
+that feature is Opus-only and this project runs Sonnet 5/Haiku for these
+nodes.
+
+**Trend/comparison answering (e.g. "how did my resume update help?")**:
+- Chat's `answer` path gets a `query_past_runs` tool: pulls the two most
+  recent `runs` rows for the user from SQLite, then both runs'
+  `scored_jobs`.
+- **Three buckets, not a single diff** — because Adzuna is a live job
+  board, the job pool itself shifts between searches independent of
+  resume quality:
+  1. **Overlapping jobs** (same `job_id` in both runs) → real before/after
+     delta, the actual "did the resume help" signal.
+  2. **New this run only** → no prior score to diff, but worth surfacing;
+     could itself be a resume-improvement signal if the updated resume
+     changed which `expanded_keywords` the orchestrator chose.
+  3. **Dropped since last run** → surfaced but explicitly *not* framed as
+     a regression — most likely explanation is the Adzuna listing expired
+     or fell outside the new search's scope/cap, not resume quality.
+- **Presentation**: an aggregate headline first (average fit_score
+  before/after, counts moved up/down/flat), then a detail list of
+  individual deltas sorted by magnitude (biggest movers first, both
+  directions shown honestly, not just the positive ones).
+- **Noise-vs-signal caveat**: `fit_score` is LLM judgment, not a
+  deterministic computation, so small deltas (roughly ±5) shouldn't be
+  narrated as real improvement/decline — only larger moves (~10+) get
+  called out as meaningful; small ones get described as "roughly
+  unchanged."
+
+**Not started** — still a real architecture milestone (router node, chat
+node with bounded intent routing, checkpointer wiring, `query_past_runs`
++ `get_job_by_id` tools, `OrchestratorState` changes to carry chat
+history), deliberately deferred to a dedicated future build session.
 
 ## Design session 2026-08-31 (Day 6, cont.) — roadmap: chat + unify into one graph
 
