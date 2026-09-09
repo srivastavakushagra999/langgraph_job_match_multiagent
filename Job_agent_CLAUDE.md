@@ -1015,3 +1015,105 @@ two sessions flagged (router node, chat ReAct loop, checkpointer wiring,
 `OrchestratorState` changes for `chat_history`/`chat_summary`/`run_id`,
 `query_past_runs`/`get_job_by_id`/`improve_resume` tools) — conceptual
 design now considerably more detailed, but no code written yet.
+
+## Build session 2026-09-09 (Day 8) — state fields, nodes/ package, conditional entry point
+
+First session with actual code on the chat milestone (Days 6-7 were design
+only). Steps 1-4 of an 8-step arc done; checkpointer onward still pending.
+
+**`OrchestratorState` extended** with the fields Day 7 specified —
+`run_id: str`, `chat_history: Annotated[list[AnyMessage], add_messages]`,
+`chat_summary: str` — plus a new `intent: Literal["search", "chat"]`
+(see routing decision below).
+
+**`run_id` vs `thread_id` — why both exist** (question raised and settled
+this session): `thread_id` is the checkpointer's key, **one per user**, and
+lives in `config={"configurable": ...}`, not in state. `run_id` identifies
+one *pipeline execution* and is the `runs` PK in `memory.py`'s SQLite.
+Collapsing them (the Claude-UI "one chat, one id" intuition) would force
+the already-reversed "new thread per search" design. Concretely: one
+`thread_id` accumulates many `run_id`s over time, and since
+`job_listings`/`realistic_matches`/`stretch_matches` are overwrite fields,
+only `run_id`-keyed SQLite rows can distinguish run N-1's scores from run
+N's — which is exactly what the 3-bucket trend comparison needs.
+
+**Why SQLite at all, given the checkpointer persists state** (challenged
+this session, answer sharpened): checkpointer = "what's true right now"
+(latest snapshot, restores on invoke); SQLite = "what was true in an
+earlier run" (queryable, survives overwrites). Checkpoint history exists
+but is not a relational store, and the already-flagged future pruning TODO
+would destroy historical job data if it were used as one. The alternative
+— putting a reducer on `realistic_matches` so all runs accumulate in state
+— was considered and rejected: every invoke would deserialize all
+historical `ScoredJob` + nested `JobListing` blobs just to answer one chat
+turn, and every checkpoint write would carry them.
+
+**Why `chat_history` growing in state is acceptable but accumulated run
+results are not** (same challenge, applied to the reducer field): it is
+bounded by design (Day 7's KEEP=30/TRIGGER=70 sawtooth), per-item size is
+orders of magnitude smaller (a message vs. 30 full job listings), and
+recent conversation is needed on *every* turn whereas old-run data is
+needed only occasionally — which is precisely why the latter sits behind
+tools. Accepted cost: `chat_history` is lossy after summarization, which is
+itself a further argument for the DB — `get_job_by_id` still resolves a job
+whose transcript mention has been summarized away.
+
+**Router: `load_session` node dropped; intent comes from the UI.** The
+2026-08-25 entry specified a conditional entry point that "checks whether a
+saved session exists ... and routes to either a `load_session` node or
+straight into the orchestrator pipeline." Two later refinements partly
+obsolete that, and this session resolved the tension:
+1. A `load_session` node has nothing to do — the checkpointer has already
+   restored full state *before* the router runs.
+2. "A saved session exists" ≠ "this turn is a chat turn". Counterexample
+   that killed the derive-from-history rule: a returning user submits the
+   form with a new role; history exists, so the rule routes to chat and the
+   requested search never runs.
+**Locked**: the UI sends `intent` explicitly (form submit → `"search"`,
+chat box → `"chat"`), with a history-emptiness check kept only as a
+defensive guard (`intent="chat"` with no history → force `"search"`).
+Consequence: the router needs **no LLM call**, so it stays a plain
+conditional-edge function rather than a node — the earlier "make it a node
+for LangSmith traceability" argument only applied if it called a model.
+
+**Accepted trade-off**: a search request typed into the chat box (e.g. "ab
+data scientist roles dhundo") is not inferred. The chat node will be
+prompted to redirect the user to the New Search form — same pattern as a
+"New chat" button rather than intent inference. `CHAT_SYSTEM_PROMPT` must
+state this explicitly, or the model will improvise.
+
+**`nodes/` package refactor** — `graph.py` (132 lines, nodes + wiring) split
+into `nodes/{orchestrator,score_agent,dreamer_agent,merge}.py` with
+`graph.py` reduced to wiring only. `route()` deliberately stayed in
+`graph.py`: it is an edge function, not a node. Two cleanups taken during
+the move rather than duplicated four ways: `load_dotenv()` hoisted to a
+single import-time call (was running per node invocation), and Score's and
+Dreamer's identical score→`ScoredJob` post-processing extracted to
+`nodes/_common.py::build_scored_jobs`.
+
+**Orchestrator now writes `run_id` and the marker message.** `run_id`
+generation cannot live in the router after all — a conditional-edge
+function returns a string and cannot write state — so it stays in
+`orchestrator`, which is the search branch's first node anyway. The marker
+(`"🔍 New search run — keywords: ..."`) is returned as an `AIMessage` and
+appended by the `add_messages` reducer. Its value only materializes once a
+*second* search has overwritten state: it is the transcript boundary that
+tells the model an earlier-mentioned job is no longer in the
+context-stuffed live results and must be fetched via `get_job_by_id`.
+
+**Remaining arc, with a dependency discovered this session** — the chat
+milestone splits in two, because the ReAct loop's tools read a database
+that does not exist yet:
+```
+5.  checkpointer (SqliteSaver + thread_id) + app.py sends intent
+6a. nodes/chat.py — plain Q&A over context-stuffed state (no tools; buildable now)
+7.  memory.py + persist node (writes runs/scored_jobs)
+6b. ReAct loop + query_past_runs/get_job_by_id (needs 7)
+8.  summarize_node (rolling summary)
+```
+6a alone yields a working chat; tools layer onto it later. `SqliteSaver`
+needs the separate `langgraph-checkpoint-sqlite` package (installed this
+session), and `from_conn_string` is a context manager — for a module-level
+`app` use `SqliteSaver(sqlite3.connect(path, check_same_thread=False))`,
+the flag mattering because Streamlit runs the script off the thread that
+opened the connection.

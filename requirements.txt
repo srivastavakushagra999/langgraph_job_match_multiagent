@@ -5,3 +5,4 @@ streamlit
 pypdf
 requests
 python-dotenv
+langgraph-checkpoint-sqlite
