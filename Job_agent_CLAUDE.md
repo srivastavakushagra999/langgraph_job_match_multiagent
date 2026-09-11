@@ -1185,3 +1185,56 @@ changes the system block, so the cache correctly misses.
 **Next**: `app.py` (Claude's) — send `intent` + fixed `thread_id`, chat box
 via `st.chat_input`, render results and chat from `get_state(config)` so they
 survive a reload. Then step 7 (`memory.py` + persist node).
+
+## Build session 2026-09-11 (Day 10) — app.py wired to the checkpointer, UI rebuild, README
+
+**Step 5 complete — the `app.py` half.** Fixed `THREAD_ID = "kushagra-main"` +
+`CONFIG` at module level; both the search `stream()` and the chat `invoke()`
+pass it. `intent` is sent on *every* invoke (`"search"` from the form,
+`"chat"` from the chat box) — `.get`'s default in `route()` only prevents a
+crash, it does not reset a persisted stale value.
+
+**`st.session_state["result"]` deleted — the checkpoint is the single source of
+truth.** Render now reads `job_matcher_app.get_state(CONFIG).values`. Two
+consequences worth recording:
+1. Results and chat survive a browser refresh, which was the whole point of
+   the checkpointer; `session_state` dies on reload.
+2. The stream loop no longer accumulates `state.update(node_output)` — it only
+   writes progress labels. Because the render block sits *below* the run block
+   in script order, `get_state` already returns the finished run's values; no
+   `st.rerun()` is needed after a search.
+A chat turn sends only `{"chat_history": [HumanMessage(q)], "intent": "chat"}`
+— preferences/resume/matches come from the checkpoint, so the PDF is not
+re-parsed per turn. After the invoke, `st.rerun()` so the fresh checkpoint
+(question *and* answer) is what renders; no hand-maintained message list.
+
+**UI rebuild.** Form moved to the sidebar, freeing the main area for a
+`st.columns([3, 2])` split: job cards in tabs on the left, a fixed-height
+(560px) chat panel on the right. Above it, four `st.metric` cards (role, jobs
+scanned, realistic/stretch counts, top score) and the expanded keywords as
+blue badges. Job cards gained a colour-coded fit badge (green ≥80, orange ≥60),
+comma-formatted salary, the gap suggestion behind an expander, and a visible
+`job_id` — the id the chat node cites, so the user can connect the two.
+- The orchestrator's `🔍 New search run` marker renders as a `st.caption`
+  rather than an assistant bubble: it reads as a run divider instead of
+  looking like the model said something.
+- `message_text()` helper flattens list-of-content-blocks responses.
+- `st.chat_input(submit_mode="disable")` blocks a second submit while a turn
+  is in flight.
+- Deliberately **no CSS injection** — native elements only, per the Streamlit
+  skill; theming belongs in `.streamlit/config.toml`.
+
+**Verification without a browser**: `streamlit.testing.v1.AppTest` runs the
+script headless and surfaces exceptions. Ran it twice — once on `app.py`
+(empty thread → info + `st.stop()`) and once on a copy with `THREAD_ID`
+patched to an existing `test-*` thread (4 metrics, 2 tabs, 2 chat messages, no
+exceptions). Useful pattern for this project: the leftover test threads are a
+free fixture for the populated-state path.
+
+**`README.md` written** (first one): mermaid graph, per-node model table,
+routing and checkpointer explanation, `.env` + `job_matcher/data/` setup,
+usage walkthrough, project structure, dev notes (smoke test, serde allowlist
+gotcha, checkpoint inspection), and the roadmap.
+
+**Next**: step 7 — `memory.py` + persist node (runs/scored_jobs tables), then
+6b (ReAct loop + `query_past_runs`/`get_job_by_id`), then 8 (summarize node).
