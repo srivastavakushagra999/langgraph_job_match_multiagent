@@ -1117,3 +1117,71 @@ session), and `from_conn_string` is a context manager — for a module-level
 `app` use `SqliteSaver(sqlite3.connect(path, check_same_thread=False))`,
 the flag mattering because Streamlit runs the script off the thread that
 opened the connection.
+
+## Build session 2026-09-11 (Day 9) — checkpointer wired, real chat node (steps 5 + 6a)
+
+**Step 5 — checkpointer (backend side done; `app.py` side still pending).**
+`graph.compile(checkpointer=SqliteSaver(conn, serde=serde))`, DB at
+`job_matcher/data/checkpoints.sqlite` (path built from `Path(__file__)` so the
+DB location doesn't depend on CWD; `data/` already gitignored). Checkpointer
+is compile-time config, not a node — LangGraph loads the latest checkpoint for
+the `thread_id` before `START` and saves after every superstep. Every
+`invoke` now needs `config={"configurable": {"thread_id": ...}}` (confirmed:
+omitting it raises `ValueError`).
+- **Serde allowlist**: pydantic state types (`Preferences`, `JobListing`,
+  `ScoredJob`) round-trip but log "Deserializing unregistered type ... will be
+  blocked in a future version". Fixed with
+  `JsonPlusSerializer(allowed_msgpack_modules=[("job_matcher.schemas", ...)])`.
+  Any new pydantic model added to state must be added here too. LangChain
+  message classes are allowed by default.
+- `route()` now uses `state.get("intent", "search")`. `intent` is persisted in
+  the checkpoint, so callers must send it on every invoke — `.get` only
+  prevents a crash, it doesn't reset a stale value.
+- Table shape, for reference: `checkpoints` (one row per superstep; full state
+  in the `checkpoint` msgpack BLOB under `channel_values`) + `writes`
+  (per-node pending writes for crash resume). Not SQL-queryable — reinforces
+  why `memory.py` needs its own tables.
+
+**`test_graph.py`** now runs turn 1 = search, turn 2 = chat on a fresh
+`test-<uuid>` thread (keeps smoke tests out of the real user thread), then
+prints `get_state(config).values`. Confirms checkpoint restore (turn 2 sends
+only the question, matches still present), `add_messages` append, and routing.
+Known side effect: each run leaves a `test-*` thread in the checkpoint DB —
+folds into the existing checkpoint-pruning TODO.
+
+**Step 6a — `nodes/chat.py` (plain Q&A, no tools).** Haiku 4.5. LLM input =
+`system` (`CHAT_SYSTEM_PROMPT` + `build_chat_context(...)`) + `chat_history`.
+The user's question is not added by the node — the UI sends it as
+`{"chat_history": [HumanMessage(q)]}` and the reducer appends it at the input
+step, before any node runs; the node returns only the `AIMessage`.
+- `build_chat_context` (in `prompts.py`): preferences, candidate_profile,
+  resume, realistic + stretch matches (job_id, title, company, location,
+  salary, score, reasoning, gap), then `chat_summary` last. **`description`
+  deliberately excluded** (~halves the ~15k-token context); description-level
+  questions will go through `get_job_by_id` in 6b.
+- **Rejected: putting history inside the system context + a separate
+  `chat_message` state field.** It would change the system block every turn
+  (breaking prompt caching's prefix match) and flatten the role structure the
+  model relies on for multi-turn reference resolution.
+- **First message must be `user`** (Anthropic API rule); `chat_history` starts
+  with the orchestrator's marker `AIMessage`. `_from_first_human()` drops
+  everything before the first `HumanMessage`; later markers stay (consecutive
+  same-role messages are merged by the API). Same helper covers the
+  post-summarization case in step 8.
+- Prompt rules: ground in context only, cite `[job_id: ...]`, jobs discussed
+  before the latest marker are "from an earlier search" (until
+  `get_job_by_id` exists), redirect search requests to the form, reply in the
+  user's language. Tools deliberately NOT mentioned until 6b — the model
+  would otherwise try to call, or claim to have called, them.
+- **Verified live**: answer cited the job_id, grounded claims in real resume
+  content, and flagged remote/salary gaps against preferences unprompted.
+
+**Prompt caching — planned, not wired.** Put `cache_control: {"type":
+"ephemeral"}` on the system block. Haiku 4.5 minimum cacheable prefix is 4096
+tokens (context is ~7k, qualifies). Write 1.25×, read 0.1×, 5-min TTL
+refreshed on each hit; break-even at 2 turns within 5 minutes. A new search
+changes the system block, so the cache correctly misses.
+
+**Next**: `app.py` (Claude's) — send `intent` + fixed `thread_id`, chat box
+via `st.chat_input`, render results and chat from `get_state(config)` so they
+survive a reload. Then step 7 (`memory.py` + persist node).

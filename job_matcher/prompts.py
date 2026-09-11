@@ -1,4 +1,4 @@
-from job_matcher.schemas import Preferences, JobListing
+from job_matcher.schemas import Preferences, JobListing, ScoredJob
 
 ORCHESTRATOR_SYSTEM_PROMPT = (
     "You are the orchestrator for a job-matching agent. Given a candidate's "
@@ -148,4 +148,64 @@ def build_dreamer_agent_human_prompt(
         f"Candidate profile (durable priorities/traits): {candidate_profile or '(none provided)'}\n\n"
         f"Resume:\n{resume_text}\n\n"
         f"Job listings to consider ({len(job_listings)} total):\n{jobs_block}"
+    )
+
+
+CHAT_SYSTEM_PROMPT = (
+    "You are the chat assistant for CareerLens, a job-matching tool. The "
+    "candidate has already run a job search; answer their follow-up questions "
+    "about those results.\n\n"
+    "Ground every answer in the context below - the resume, candidate "
+    "profile, preferences, and the scored matches (with each job's score, "
+    "reasoning, and gap suggestion). Never invent skills, experience, job "
+    "requirements, or salaries that the context doesn't show. If the context "
+    "doesn't contain the answer, say so plainly.\n\n"
+    "Whenever you mention a specific job, include its id as [job_id: ...] so "
+    "it can be referenced unambiguously later.\n\n"
+    "Messages starting with '🔍 New search run' mark a new search. The "
+    "matches in the context are from the LATEST run only - if the user refers "
+    "to a job discussed before the latest marker that isn't in the current "
+    "matches, tell them it's from an earlier search and you no longer have "
+    "its details.\n\n"
+    "You cannot run new searches. If the user asks for different roles, "
+    "locations, or a fresh search, tell them to use the New Search form "
+    "above the chat.\n\n"
+    "Be concise and direct. Reply in the same language the user writes in."
+)
+
+
+def build_chat_context(
+    prefs: Preferences,
+    resume_text: str,
+    candidate_profile: str,
+    realistic_matches: list[ScoredJob],
+    stretch_matches: list[ScoredJob],
+    chat_summary: str,
+) -> str:
+    def jobs_block(matches: list[ScoredJob]) -> str:
+        if not matches:
+            return "(none)"
+        return "\n\n".join(
+            f"[job_id: {sj.job.id}] {sj.job.position} - {sj.job.company}\n"
+            f"Location: {sj.job.location}\n"
+            f"Salary: {sj.job.salary_min or 'unknown'} - {sj.job.salary_max or 'unknown'}\n"
+            f"Fit score: {sj.fit_score}/100\n"
+            f"Reasoning: {sj.reasoning}\n"
+            f"Gap suggestion: {sj.gap_suggestion}"
+            for sj in matches
+        )
+
+    return (
+        f"=== PREFERENCES ===\n"
+        f"Role requested: {prefs.role}\n"
+        f"Remote required: {prefs.remote}\n"
+        f"Salary minimum: {prefs.salary_min} {prefs.currency}\n"
+        f"Base location: {prefs.base_location}\n"
+        f"Open to onsite at base location: {prefs.open_to_onsite_at_base}\n"
+        f"Additional context: {prefs.additional_context or '(none)'}\n\n"
+        f"=== CANDIDATE PROFILE ===\n{candidate_profile or '(none provided)'}\n\n"
+        f"=== RESUME ===\n{resume_text}\n\n"
+        f"=== REALISTIC MATCHES ({len(realistic_matches)}) ===\n{jobs_block(realistic_matches)}\n\n"
+        f"=== STRETCH MATCHES ({len(stretch_matches)}) ===\n{jobs_block(stretch_matches)}\n\n"
+        f"=== EARLIER CONVERSATION SUMMARY ===\n{chat_summary or '(none)'}"
     )
