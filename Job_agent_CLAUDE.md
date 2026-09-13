@@ -1238,3 +1238,70 @@ gotcha, checkpoint inspection), and the roadmap.
 
 **Next**: step 7 — `memory.py` + persist node (runs/scored_jobs tables), then
 6b (ReAct loop + `query_past_runs`/`get_job_by_id`), then 8 (summarize node).
+
+## Build session 2026-09-13 (Day 10) — memory.py + persist node (step 7)
+
+**Table design collapsed from two tables to one — `run_jobs`.** Originally
+planned `runs` (one row per search) + `scored_jobs` (one row per scored job),
+joined on `run_id`. Reworked to a single denormalized `run_jobs` table: every
+scored-job row also carries the run-level columns (`role`, `base_location`,
+`keywords`, `context_signals`, `jobs_scanned`), repeated per row. Trade-off
+accepted knowingly: a run with zero scored jobs (both `realistic_matches` and
+`stretch_matches` empty) leaves no row at all, so that run becomes
+untraceable — judged rare enough to accept rather than keep two tables for.
+`jobs_scanned` is stored as a raw copied value (`len(job_listings)`), not
+derived from `COUNT(*)` on the table — the LLM only *selects* a subset of the
+scanned jobs into its output, so job-row count and jobs-scanned are genuinely
+different numbers, never mutually derivable.
+```sql
+CREATE TABLE run_jobs (
+    run_id, thread_id, created_at,
+    role, base_location, keywords, context_signals, jobs_scanned,
+    job_id, bucket,                       -- 'realistic' | 'stretch'
+    position, company, location, url, salary_min, salary_max, description,
+    fit_score, reasoning, gap_suggestion,
+    PRIMARY KEY (run_id, job_id, bucket)  -- bucket in the key: same job can
+);                                        -- legitimately appear in both buckets
+CREATE INDEX idx_run_jobs_job_id ON run_jobs(job_id);  -- for 6b's get_job_by_id
+```
+`description` is deliberately persisted here even though `build_chat_context`
+excludes it from the live prompt — this table is the only place 6b's
+`get_job_by_id` tool can recover it later.
+
+**`job_matcher/memory/memory.py`** — `DB_PATH` at `job_matcher/data/memory.sqlite`
+(sibling to `checkpoints.sqlite`, separate file: the checkpoint DB's
+`channel_values` blob isn't SQL-queryable, and a separate file avoids
+write-lock contention with the checkpointer's own connection). Fresh
+short-lived connection per call (`_connect()`), not a module-level one —
+side-steps the `check_same_thread` issue already hit with the checkpointer,
+and writes are cheap enough not to need a persistent connection.
+`save_run(state, thread_id)` builds one row per `ScoredJob` across both
+match lists via a shared `_row()` helper, then a single `executemany` inside
+one `with conn:` transaction (atomic — no half-written run). Row values are
+positional in a 20-column tuple, matched by an explicit column list in the
+`INSERT OR REPLACE`, not a bare `VALUES (?,...)` — keeps a future column
+reorder from silently misaligning values.
+
+**`job_matcher/nodes/persist.py`** — new node, signature
+`persist(state: OrchestratorState, config: RunnableConfig) -> dict`. Confirms
+the same pattern as `route()`'s use of state: LangGraph inspects a node's
+signature and passes `config` only if declared — `thread_id` lives in config,
+not state, because it's a per-invoke caller concern, not graph data. Returns
+`{}`: this node's only job is the DB side effect, nothing flows back into the
+checkpoint. Wired `merge → persist → END` (replacing `merge → END`); the chat
+path (`chat_node → END`) is untouched, so a chat turn correctly does not
+persist (`run_id` would be stale).
+
+**Verified live** via `test_graph.py` (search turn + chat turn on a fresh
+`test-*` thread), then queried `memory.sqlite` directly: `run_id`/`thread_id`/
+`role`/`keywords`/`jobs_scanned` correct on every row, 30 `realistic` rows +
+6 `stretch` rows for the one run, `description` and `gap_suggestion`
+populated. One transient failure during the run — `dreamer_agent`'s
+structured-output call returned a `recommendation` key instead of
+`gap_suggestion`, a pydantic `ValidationError`; retried clean. Model
+occasionally missing a required structured-output field, not a prompt or
+schema bug (prompt text confirmed correct in `prompts.py`).
+
+**Next**: step 6b — `query_past_runs` + `get_job_by_id` tools reading from
+`run_jobs`, then swap `chat_node`'s plain `llm.invoke` for a tool-calling
+(ReAct) loop. Then step 8 (summarize node).
