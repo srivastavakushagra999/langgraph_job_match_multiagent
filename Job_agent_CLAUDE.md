@@ -1419,3 +1419,61 @@ metrics populated from the live checkpoint.
 renaming it to `connect` is the tidy follow-up. `tools/__init__.py` does not
 re-export the two new tools — `chat.py` imports them by full path — which is
 fine but inconsistent with how `jobs.py` is exposed.
+
+## Backlog as of 2026-09-14 (end of Day 11)
+
+Audited against the code, not from memory. Grouped by kind, not priority.
+
+### Feature work, directly next
+
+- **Step 8 — summarize node.** `chat_summary` currently has three readers
+  (`state.py`, `prompts.build_chat_context`, `nodes/chat.py`) and **zero
+  writers**, so the summary block always renders `(none)` and nothing is ever
+  trimmed. Day 7 specified a KEEP=30/TRIGGER=70 sawtooth. Carry over the
+  constraint proved in Day 11: an `AIMessage` carrying `tool_calls` and its
+  `ToolMessage` are a pair, and dropping one while keeping the other returns
+  HTTP 400 `unexpected tool_use_id found in tool_result blocks`. A fixed-index
+  cut will eventually land inside a pair and fail intermittently, so the
+  trimmer has to move the cut off a pair boundary.
+- **`improve_resume` tool.** Direction locked back on 2026-08-31 (structured
+  output → RenderCV YAML → typst PDF, generate fresh rather than edit the
+  original PDF) and prototyped live, but the tool's interface and schema are
+  still unspecified and no code exists. It is the third member of the chat
+  toolkit Day 7 named, alongside the two built on Day 11.
+
+### Declared project goals not yet started
+
+These are named in this doc's own "Observability, evals, and memory" section as
+the point of the project, and none of them has any code yet.
+
+- **LangSmith tracing.** `.env` holds only `ANTHROPIC_API_KEY`,
+  `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`. No `LANGCHAIN_TRACING_V2`,
+  `LANGCHAIN_API_KEY` or `LANGCHAIN_PROJECT`, and no mention of langsmith
+  anywhere in the source. Cheapest item on this list and the most useful for
+  everything below it, since the chat branch is now a loop whose call count
+  varies per turn.
+- **Evals.** No `tests/` or `evals/` directory exists. The three evaluators
+  this doc already specifies: reasoning is grounded in actual resume content,
+  gap suggestions are concrete rather than generic, and Dreamer's stretch
+  matches are genuinely distinct from Score's. Day 11 is an argument for
+  building these: two real bugs and one prompt regression were caught only by
+  running 5 trials per question, and single runs actively misled (a 1-run
+  difference looked like a fix that 5 trials showed was noise).
+- **Graph API vs Functional API comparison.** The original reason for this
+  project. `entrypoint` and `@task` appear nowhere in the repo, so the
+  Functional API is still untouched. The chat branch is now a good candidate to
+  rewrite both ways and compare, since it exercises a cycle, a conditional
+  edge, tool dispatch and a checkpointer in a small amount of code.
+
+### Cleanup
+
+- `tools/past_runs.py` imports `memory.memory._connect`, a private name.
+  Renaming it to `connect` is the tidy fix.
+- `tools/__init__.py` re-exports the four names from `jobs.py` but not
+  `query_past_runs`/`get_job_by_id`. Works, because `nodes/chat.py` imports
+  them by full path, but it is inconsistent.
+- **`checkpoints.sqlite` has 29 throwaway threads** — 25 `test-day11-*` from
+  Day 11's trial runs plus 4 older `test-*` — against one real thread,
+  `kushagra-main`. Worth a `DELETE FROM checkpoints WHERE thread_id LIKE
+  'test-%'` (and the same for the other checkpointer tables) before the next
+  session.
