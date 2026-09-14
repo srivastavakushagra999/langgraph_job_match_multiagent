@@ -1305,3 +1305,71 @@ schema bug (prompt text confirmed correct in `prompts.py`).
 **Next**: step 6b — `query_past_runs` + `get_job_by_id` tools reading from
 `run_jobs`, then swap `chat_node`'s plain `llm.invoke` for a tool-calling
 (ReAct) loop. Then step 8 (summarize node).
+
+## Build session 2026-09-14 (Day 11) — memory tools + chat prompt rewrite (step 6b, partial)
+
+**`tools.py` became the `tools/` package.** A bare `tools/` directory next to
+`tools.py` is a trap: Python resolves the regular module over an empty
+namespace package, so it silently keeps working until you add
+`tools/__init__.py`, at which point the package shadows the file and both
+importers (`nodes/orchestrator.py`, `app.py`) break at once. Resolved by
+`git mv tools.py tools/jobs.py` plus an `__init__.py` that re-exports
+`COUNTRY_CODE_MAP`, `_map_country_code`, `filter_top_jobs`, `search_jobs`, so
+the two existing import lines stay untouched. Same re-export pattern as
+`nodes/`. Note the two files have different audiences: `jobs.py` holds plain
+helpers the orchestrator calls directly, `past_runs.py` holds LLM-facing
+`@tool` functions whose docstrings are prompt text.
+
+**`tools/past_runs.py`** — `get_job_by_id(job_id)` and `query_past_runs(role,
+position, company, min_fit_score, limit, group_by_run)`. Both reuse
+`memory.memory._connect()` (private import, a rename to `connect` is the tidy
+follow-up) and return formatted strings rather than raw rows, same reasoning
+as `build_chat_context`: you control exactly what the model sees. Misses
+return a plain sentence, never an exception, so the ReAct loop can recover.
+`MAX_ROWS = 25` clamps `limit` because the model picks that argument.
+
+**Two bugs found by testing against a simulated two-run DB, not by reading.**
+First, `role` is `prefs.role` (what was *searched for*), not the job's title —
+every row in every run carries the same value, so `role='Senior AI Engineer'`
+returned nothing and the model had no way to find a job by name. Added a
+`position` filter (the job's own title) and spelled the distinction out in the
+docstring. Second, `ORDER BY created_at DESC LIMIT n` can never reach an older
+run: one run alone produced 36 rows, so even at the 25-row cap every row came
+from the newest run. Added `group_by_run=True`, which switches the query to
+`GROUP BY run_id` returning one line per run with match count, average and best
+fit score — now `LIMIT 25` means 25 *runs*, not 25 jobs.
+
+**`CHAT_SYSTEM_PROMPT` rewritten** for a tool-calling model. Old text told the
+model to say a job from an earlier run was gone — exactly what `get_job_by_id`
+now handles. Replaced the grounding paragraph's tool-blind fallback with an
+explicit ordered three-source taxonomy: FIRST the messages above, SECOND the
+context block, THIRD the tools, with "do NOT call a tool for anything the first
+two already contain" as the over-calling guard. Added a look-first rule (never
+ask permission to look something up; ask only when the *tool result* is
+ambiguous) and made the language line script-aware after the model answered
+Hinglish questions in Devanagari and Urdu.
+
+**Measured, 5 trials per question, Haiku 4.5** (tool-called / 5):
+
+| question | before prompt+tool fixes | after |
+|---|---|---|
+| job by title only | 0/5 (no `position` filter) | 5/5 |
+| job by title + company | 5/5 | 5/5 |
+| compare this run to last | 0/5 useful | 5/5 |
+
+The "ask which one if it isn't clear" clause was measured at 4/5 both with and
+without it — no effect, and it contradicted the new look-first rule, so it was
+dropped. Worth remembering that single-run behaviour differences here are
+noise; only repeated trials separated the real fix from variance.
+
+**`nodes/chat.py`** now binds the two tools (`CHAT_TOOLS`). **This leaves the
+chat branch half-wired and temporarily worse than before**: the model emits
+`tool_calls`, nothing executes them, and the message goes straight to END.
+
+**Next**: `graph.py` — `ToolNode(CHAT_TOOLS, messages_key="chat_history")`,
+`add_conditional_edges("chat_node", lambda s: tools_condition(s,
+messages_key="chat_history"), {"tools": "chat_tools", "__end__": END})`, and
+`chat_tools -> chat_node`, replacing `chat_node -> END`. Both helpers default
+to a `"messages"` key this state does not have, so `messages_key` is mandatory
+in both places. Then step 8 (summarize node), which must also handle the
+tool-call and ToolMessage traffic now landing in `chat_history`.
