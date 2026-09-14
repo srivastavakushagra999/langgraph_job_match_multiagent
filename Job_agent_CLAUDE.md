@@ -1400,6 +1400,20 @@ intermittently. Step 8's trimming cannot simply keep the last N messages; it
 has to move the cut off a pair boundary. `_from_first_human` is unaffected,
 since it cuts at the first `HumanMessage` and pairs only ever form after one.
 
+**UI pass.** The app had no theme at all, so `.streamlit/config.toml` gained a
+dark theme (Inter, JetBrains Mono for code, indigo accent, 6px radius, darker
+sidebar) alongside the existing `[server]` block — that single change did more
+than any markup edit. In `app.py`: job cards put the title and a right-aligned
+score badge on one row with company/location/salary collapsed into a single
+icon caption; `score_badge()` became `score_color()` now that `st.badge` is
+used directly; metrics gained `help` tooltips; the search status ticks use a
+Material icon instead of an emoji. The chat panel shows three `st.pills`
+suggestion chips before the first question, guarded on
+`any(isinstance(m, HumanMessage) ...)` so they stop rendering once the
+conversation starts and the widget cannot re-fire its value; typed input and a
+picked chip now share one submit path. Verified with `AppTest`: zero exceptions,
+metrics populated from the live checkpoint.
+
 **Next**: step 8 (summarize node), with the pair-boundary constraint above.
 `memory.memory._connect` is still a private import from `tools/past_runs.py`;
 renaming it to `connect` is the tidy follow-up. `tools/__init__.py` does not

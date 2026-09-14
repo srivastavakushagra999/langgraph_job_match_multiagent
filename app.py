@@ -21,6 +21,15 @@ CONFIG = {"configurable": {"thread_id": THREAD_ID}}
 
 SEARCH_MARKER = "🔍 New search run"
 
+CHAT_SUGGESTIONS = {
+    ":material/trending_up: Strongest match?":
+        "Which of these matches is the strongest for me, and why?",
+    ":material/school: What should I learn?":
+        "Across all these jobs, what is the one skill I should learn next?",
+    ":material/history: Compare with last search":
+        "How did this search compare with my previous one?",
+}
+
 NODE_LABELS = {
     "orchestrator": "Searching jobs & expanding keywords",
     "score_agent": "Scoring realistic matches",
@@ -44,9 +53,8 @@ def message_text(msg) -> str:
     return msg.content
 
 
-def score_badge(score: int) -> str:
-    color = "green" if score >= 80 else "orange" if score >= 60 else "gray"
-    return f":{color}-badge[{score}/100 fit]"
+def score_color(score: int) -> str:
+    return "green" if score >= 80 else "orange" if score >= 60 else "gray"
 
 
 def format_salary(job) -> str | None:
@@ -60,30 +68,39 @@ def format_salary(job) -> str | None:
 def render_job_card(scored_job: ScoredJob, gap_label: str, gap_icon: str) -> None:
     job = scored_job.job
     with st.container(border=True):
-        st.markdown(f"#### {job.position}")
-        st.markdown(
-            f"**{job.company}** &nbsp;·&nbsp; :material/location_on: {job.location} "
-            f"&nbsp;·&nbsp; {score_badge(scored_job.fit_score)}"
-        )
+        title_col, score_col = st.columns([5, 1], vertical_alignment="center")
+        title_col.markdown(f"#### {job.position}")
+        with score_col, st.container(horizontal_alignment="right"):
+            st.badge(
+                f"{scored_job.fit_score}",
+                color=score_color(scored_job.fit_score),
+                icon=":material/target:",
+                help=f"{scored_job.fit_score}/100 fit against your resume",
+            )
 
-        salary = format_salary(job)
-        if salary:
-            st.caption(f":material/payments: {salary}")
+        meta = [
+            f":material/apartment: {job.company}",
+            f":material/location_on: {job.location}",
+        ]
+        if salary := format_salary(job):
+            meta.append(f":material/payments: {salary}")
+        st.caption("  ·  ".join(meta))
 
         st.write(scored_job.reasoning)
 
         with st.expander(gap_label, icon=gap_icon):
             st.write(scored_job.gap_suggestion)
 
-        with st.container(horizontal=True):
+        with st.container(horizontal=True, vertical_alignment="center"):
             st.link_button("View listing", job.url, icon=":material/open_in_new:")
-            st.caption(f"job_id: {job.id}")
+            st.caption(f"`{job.id}`")
 
 
 # --- sidebar: search form ---
 
 with st.sidebar:
     st.markdown("### :material/search: New search")
+    st.caption("Every search replaces the results and starts a fresh chat context.")
 
     with st.form("preferences_form"):
         role = st.text_input("Target role", placeholder="e.g. AI Engineer")
@@ -174,7 +191,8 @@ if submitted:
         try:
             for chunk in job_matcher_app.stream(search_input, CONFIG, stream_mode="updates"):
                 for node_name in chunk:
-                    status.write(f"✅ {NODE_LABELS.get(node_name, node_name)}")
+                    label = NODE_LABELS.get(node_name, node_name)
+                    status.write(f":material/check_circle: {label}")
         except Exception as exc:
             status.update(label="Failed", state="error")
             st.error(f"Something went wrong while matching jobs: {exc}")
@@ -200,10 +218,22 @@ all_matches = realistic_matches + stretch_matches
 top_score = max((m.fit_score for m in all_matches), default=0)
 
 metric_cols = st.columns(4, border=True)
-metric_cols[0].metric("Searched for", preferences.role if preferences else "—")
-metric_cols[1].metric("Jobs scanned", len(result.get("job_listings", [])))
-metric_cols[2].metric("Realistic / stretch", f"{len(realistic_matches)} / {len(stretch_matches)}")
-metric_cols[3].metric("Top fit score", f"{top_score}/100")
+metric_cols[0].metric(
+    "Searched for", preferences.role if preferences else "—",
+    help="The role you asked for. The agent also searches adjacent titles.",
+)
+metric_cols[1].metric(
+    "Jobs scanned", len(result.get("job_listings", [])),
+    help="Listings pulled from Adzuna before scoring.",
+)
+metric_cols[2].metric(
+    "Realistic / stretch", f"{len(realistic_matches)} / {len(stretch_matches)}",
+    help="Realistic matches fit today. Stretch matches need a gap closed first.",
+)
+metric_cols[3].metric(
+    "Top fit score", f"{top_score}/100",
+    help="Best fit score across both buckets.",
+)
 
 if keywords := result.get("expanded_keywords"):
     st.caption("Keywords searched: " + " ".join(f":blue-badge[{k}]" for k in keywords))
@@ -231,11 +261,14 @@ with chat_col:
     st.markdown("### :material/forum: Ask about your matches")
 
     chat_history = result.get("chat_history", [])
+    asked_before = any(isinstance(m, HumanMessage) for m in chat_history)
+
     with st.container(border=True, height=560):
-        if len(chat_history) <= 1:
+        if not asked_before:
             st.caption(
                 "Ask anything about these results — why a job scored the way it did, "
-                "how your resume lines up, what to learn next."
+                "how your resume lines up, what to learn next. The assistant can also "
+                "look up jobs from your earlier searches."
             )
 
         for msg in chat_history:
@@ -256,10 +289,26 @@ with chat_col:
             with st.chat_message(role_name):
                 st.write(text)
 
-    if question := st.chat_input("Ask about your matches", submit_mode="disable"):
+    # Suggestion chips only before the first question; once chat_history has a
+    # HumanMessage they stop rendering, so the widget cannot re-fire its value.
+    pending_question = None
+    if not asked_before:
+        picked = st.pills(
+            "Try asking",
+            list(CHAT_SUGGESTIONS),
+            label_visibility="collapsed",
+            key="chat_suggestions",
+        )
+        if picked:
+            pending_question = CHAT_SUGGESTIONS[picked]
+
+    if typed := st.chat_input("Ask about your matches", submit_mode="disable"):
+        pending_question = typed
+
+    if pending_question:
         with st.spinner("Thinking..."):
             job_matcher_app.invoke(
-                {"chat_history": [HumanMessage(question)], "intent": "chat"},
+                {"chat_history": [HumanMessage(pending_question)], "intent": "chat"},
                 CONFIG,
             )
         st.rerun()
