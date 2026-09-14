@@ -1321,7 +1321,7 @@ helpers the orchestrator calls directly, `past_runs.py` holds LLM-facing
 `@tool` functions whose docstrings are prompt text.
 
 **`tools/past_runs.py`** — `get_job_by_id(job_id)` and `query_past_runs(role,
-position, company, min_fit_score, limit, group_by_run)`. Both reuse
+position, company, min_fit_score, limit, summary_only)`. Both reuse
 `memory.memory._connect()` (private import, a rename to `connect` is the tidy
 follow-up) and return formatted strings rather than raw rows, same reasoning
 as `build_chat_context`: you control exactly what the model sees. Misses
@@ -1335,9 +1335,19 @@ returned nothing and the model had no way to find a job by name. Added a
 `position` filter (the job's own title) and spelled the distinction out in the
 docstring. Second, `ORDER BY created_at DESC LIMIT n` can never reach an older
 run: one run alone produced 36 rows, so even at the 25-row cap every row came
-from the newest run. Added `group_by_run=True`, which switches the query to
+from the newest run. Added `summary_only=True`, which switches the query to
 `GROUP BY run_id` returning one line per run with match count, average and best
 fit score — now `LIMIT 25` means 25 *runs*, not 25 jobs.
+
+**A tool parameter's NAME steers the model as much as its docstring.** That
+flag was first called `group_by_run`, and on "pichle search run me kaunsi jobs
+aayi thi" the model picked it 2 times in 5 — the wrong mode, since grouped rows
+carry no job titles or ids, so it then claimed it needed to look the jobs up
+again. Tightening the docstring took it to 3/5. Renaming the parameter to
+`summary_only`, with no further docstring change of substance, took it to 5/5:
+the word "run" in the parameter name was colliding with the user's own word
+"run" and pulling the model toward the grouped mode. Worth remembering the next
+time a tool is called at the right time but with the wrong arguments.
 
 **`CHAT_SYSTEM_PROMPT` rewritten** for a tool-calling model. Old text told the
 model to say a job from an earlier run was gone — exactly what `get_job_by_id`
@@ -1362,14 +1372,36 @@ without it — no effect, and it contradicted the new look-first rule, so it was
 dropped. Worth remembering that single-run behaviour differences here are
 noise; only repeated trials separated the real fix from variance.
 
-**`nodes/chat.py`** now binds the two tools (`CHAT_TOOLS`). **This leaves the
-chat branch half-wired and temporarily worse than before**: the model emits
-`tool_calls`, nothing executes them, and the message goes straight to END.
+**Step 6b complete — the ReAct loop is wired.** `nodes/chat.py` binds the two
+tools as `CHAT_TOOLS`; `graph.py` adds `ToolNode(CHAT_TOOLS,
+messages_key="chat_history")` as `chat_tools`, replaces `chat_node -> END` with
+a conditional edge on `tools_condition`, and closes the loop with
+`chat_tools -> chat_node`. Both helpers default to a `"messages"` key this
+state does not have, so `messages_key` is mandatory in both places — omitting
+it raises `ValueError: No messages found in input state to tool_edge`, which at
+least fails loudly. Verified end to end on throwaway `test-day11-*` threads:
+one question produces `HumanMessage -> AIMessage(tool_calls) -> ToolMessage ->
+AIMessage`, and mode selection now measures 5/5 correct on both a job-listing
+question and a run-comparison question.
 
-**Next**: `graph.py` — `ToolNode(CHAT_TOOLS, messages_key="chat_history")`,
-`add_conditional_edges("chat_node", lambda s: tools_condition(s,
-messages_key="chat_history"), {"tools": "chat_tools", "__end__": END})`, and
-`chat_tools -> chat_node`, replacing `chat_node -> END`. Both helpers default
-to a `"messages"` key this state does not have, so `messages_key` is mandatory
-in both places. Then step 8 (summarize node), which must also handle the
-tool-call and ToolMessage traffic now landing in `chat_history`.
+**`app.py` now filters tool traffic out of the transcript.** The render loop
+turned every non-`HumanMessage` into an assistant bubble, so the wired loop
+would have shown the user three bubbles per question, one of them raw SQL rows.
+`ToolMessage` is skipped entirely and a tool-call `AIMessage` renders as a
+one-line caption naming the tool, so the lookup is visible without exposing its
+output.
+
+**The API pairs a tool call with its result, and trimming must respect that.**
+Confirmed against the real API: dropping the `AIMessage` that carries
+`tool_calls` while keeping its `ToolMessage` returns HTTP 400, `unexpected
+tool_use_id found in tool_result blocks`. Day 7's KEEP=30/TRIGGER=70 sawtooth
+cuts at a fixed index, so it will eventually cut between such a pair and fail
+intermittently. Step 8's trimming cannot simply keep the last N messages; it
+has to move the cut off a pair boundary. `_from_first_human` is unaffected,
+since it cuts at the first `HumanMessage` and pairs only ever form after one.
+
+**Next**: step 8 (summarize node), with the pair-boundary constraint above.
+`memory.memory._connect` is still a private import from `tools/past_runs.py`;
+renaming it to `connect` is the tidy follow-up. `tools/__init__.py` does not
+re-export the two new tools — `chat.py` imports them by full path — which is
+fine but inconsistent with how `jobs.py` is exposed.

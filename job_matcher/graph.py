@@ -5,8 +5,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from job_matcher.nodes import chat, dreamer_agent, merge, orchestrator, persist, score_agent
+from job_matcher.nodes.chat import CHAT_TOOLS
 from job_matcher.state import OrchestratorState
 
 
@@ -42,7 +44,13 @@ graph.add_node("persist", persist)
 
 graph.add_node("chat_node", chat)
 graph.add_conditional_edges(START, route, {"search": "orchestrator", "chat": "chat_node"})
-graph.add_edge("chat_node", END)
+graph.add_node("chat_tools", ToolNode(CHAT_TOOLS, messages_key="chat_history"))
+graph.add_conditional_edges(
+    "chat_node",
+    lambda state: tools_condition(state, messages_key="chat_history"),
+    {"tools": "chat_tools", "__end__": END},
+)
+graph.add_edge("chat_tools", "chat_node")
 graph.add_edge("orchestrator", "score_agent")
 graph.add_edge("orchestrator", "dreamer_agent")
 graph.add_edge("score_agent", "merge")

@@ -48,7 +48,7 @@ def query_past_runs(
     company: str | None = None,
     min_fit_score: int | None = None,
     limit: int = 10,
-    group_by_run: bool = False,
+    summary_only: bool = False,
 ) -> str:
     """Search jobs stored by earlier search runs. Use this for questions about
     previous searches - what came up before, whether a company or job has
@@ -57,12 +57,15 @@ def query_past_runs(
     All three text filters match partial text: `position` is the job's own
     title (e.g. 'Senior AI Engineer'), `company` is the employer, and `role`
     is what the candidate searched for, not the job's title. To find a job the
-    user named, use `position` and/or `company`. Set group_by_run=True to
-    compare whole searches against each other - it returns one line per past
-    run with that run's match count, average and best fit score, instead of
-    individual jobs. Use it for questions like whether results improved since
-    last time. Returns a compact list without posting text - call
-    get_job_by_id for the full posting of any job."""
+    user named, use `position` and/or `company`.
+    Leave summary_only=False (the default) for almost everything, including
+    any question naming or listing jobs, even when the user mentions a past
+    run - that mode returns the jobs themselves with titles, companies and
+    ids. Set summary_only=True ONLY when the user wants statistics about
+    searches as a whole, such as whether scores improved between searches: it
+    returns per-search averages with NO job titles or ids at all, so it cannot
+    name a single job. Returns a compact list without posting
+    text - call get_job_by_id for the full posting of any job."""
     clauses, params = [], []
     if role:
         clauses.append("role LIKE ?")
@@ -80,7 +83,7 @@ def query_past_runs(
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(max(1, min(limit, MAX_ROWS)))
 
-    if group_by_run:
+    if summary_only:
         with _connect() as conn:
             runs = conn.execute(
                 f"""

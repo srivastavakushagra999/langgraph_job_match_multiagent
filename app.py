@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from job_matcher.graph import app as job_matcher_app
 from job_matcher.resume import parse_resume
@@ -242,6 +242,15 @@ with chat_col:
             text = message_text(msg)
             if isinstance(msg, AIMessage) and text.startswith(SEARCH_MARKER):
                 st.caption(text)
+                continue
+            # Tool traffic lives in chat_history too. The raw tool output is
+            # for the model, not the user; the tool-call message is shown as a
+            # one-line note so the lookup isn't invisible.
+            if isinstance(msg, ToolMessage):
+                continue
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                names = ", ".join(tc["name"] for tc in msg.tool_calls)
+                st.caption(f":material/search: Checking past searches ({names})")
                 continue
             role_name = "user" if isinstance(msg, HumanMessage) else "assistant"
             with st.chat_message(role_name):
