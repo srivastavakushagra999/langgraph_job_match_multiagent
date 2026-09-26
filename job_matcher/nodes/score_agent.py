@@ -25,7 +25,7 @@ def score_agent(state: OrchestratorState) -> dict:
             ),
         ),
     ]
-    decision: ScoreAgentOutput = llm.with_structured_output(ScoreAgentOutput).invoke(
+    decision: ScoreAgentOutput = llm.with_structured_output(ScoreAgentOutput, method="json_schema").invoke(
         messages
     )
 

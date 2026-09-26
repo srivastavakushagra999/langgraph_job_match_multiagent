@@ -21,7 +21,7 @@ def orchestrator(state: OrchestratorState) -> dict:
         ("user", build_orchestrator_human_prompt(prefs, resume_text)),
     ]
     decision: OrchestratorDecision = llm.with_structured_output(
-        OrchestratorDecision
+        OrchestratorDecision, method="json_schema"
     ).invoke(messages)
 
     country_code = _map_country_code(prefs.base_location)
