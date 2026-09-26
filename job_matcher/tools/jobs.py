@@ -16,6 +16,7 @@ def _fetch_adzuna(keyword: str, country_code: str) -> list[dict]:
         "app_id": os.environ["ADZUNA_APP_ID"],
         "app_key": os.environ["ADZUNA_APP_KEY"],
         "what": keyword,
+        "results_per_page": 50,
         "content-type": "application/json",
     }
     last_exc = None
@@ -89,7 +90,11 @@ def _map_country_code(base_location: str) -> str:
     return COUNTRY_CODE_MAP[base_location]
 
 def filter_top_jobs(job_listings, keywords, limit=30):
+    # Whole words only (so "ai" doesn't match "maintenance"), and each keyword
+    # word counts once even if it repeats across keywords.
+    keyword_words = {w for kw in keywords for w in re.findall(r"\w+", kw.lower())}
+
     def relevance(job):
         text = (job.position + " " + " ".join(job.tags)).lower()
-        return sum(1 for kw in keywords for word in kw.lower().split() if word in text)
+        return len(keyword_words & set(re.findall(r"\w+", text)))
     return sorted(job_listings, key=relevance, reverse=True)[:limit]
