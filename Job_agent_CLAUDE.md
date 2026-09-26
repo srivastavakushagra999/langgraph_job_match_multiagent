@@ -1477,3 +1477,24 @@ the point of the project, and none of them has any code yet.
   `kushagra-main`. Worth a `DELETE FROM checkpoints WHERE thread_id LIKE
   'test-%'` (and the same for the other checkpointer tables) before the next
   session.
+
+## Build session 2026-09-26 (Day 12) — search pool, filter fix, chat streaming, structured-output fix
+
+- `jobs.py`: Adzuna was called with no `results_per_page`, so each keyword
+  returned 10 results; now 50. Descriptions are still ~500-char snippets
+  (Adzuna API limit, measured avg 499); left as-is until evals show whether
+  it hurts grounding.
+- `filter_top_jobs`: matched substrings ("ai" hit "maintenance") and counted
+  repeated keyword words many times ("engineer" ×4 let "Data Engineer" beat
+  AI roles). Now whole-word matching over a set of keyword words.
+- `app.py`: chat reply streams via `stream_mode="messages"` +
+  `st.write_stream` (user message shows immediately); hero header, chat
+  avatars, card hover, ~20 lines of CSS on `.st-key-*`/`data-testid` hooks only.
+- Structured output: Score agent crashed with `scores` returned as a JSON
+  string instead of a list. All three `with_structured_output` calls now use
+  `method="json_schema"` (constrained decoding). Verified by running
+  orchestrator → score → dreamer on saved inputs (30 jobs, 30/4 matches).
+- Left a `test-day12-stream` checkpoint thread; covered by the `test-%` cleanup.
+- Hybrid (keyword + semantic) job filtering discussed; deferred until evals
+  exist to measure it.
+- Next: LangSmith → evals → step 8, per the backlog above.
