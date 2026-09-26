@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from job_matcher.graph import app as job_matcher_app
 from job_matcher.resume import parse_resume
@@ -20,6 +20,34 @@ THREAD_ID = "kushagra-main"
 CONFIG = {"configurable": {"thread_id": THREAD_ID}}
 
 SEARCH_MARKER = "🔍 New search run"
+
+AVATARS = {"user": ":material/person:", "assistant": ":material/smart_toy:"}
+
+# Thin CSS layer for what the theme can't do. Only stable hooks: .st-key-*
+# classes (from key=) and data-testid attributes, never generated class names.
+CSS = """
+<style>
+.block-container { padding-top: 2.5rem; }
+.st-key-hero {
+  background: linear-gradient(120deg, #6366f126 0%, #8b5cf614 55%, transparent 100%);
+  border: 1px solid #6366f140;
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+}
+.st-key-hero h1 { letter-spacing: -0.02em; padding: 0; }
+[class*="st-key-card_"] {
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+[class*="st-key-card_"]:hover {
+  transform: translateY(-2px);
+  border-color: #6366f180;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
+}
+[data-testid="stMetricLabel"] p {
+  text-transform: uppercase; letter-spacing: .06em; font-size: .72rem; opacity: .75;
+}
+</style>
+"""
 
 CHAT_SUGGESTIONS = {
     ":material/trending_up: Strongest match?":
@@ -42,6 +70,7 @@ st.set_page_config(
     page_icon=":material/work_history:",
     layout="wide",
 )
+st.html(CSS)
 
 
 # --- helpers ---
@@ -65,9 +94,22 @@ def format_salary(job) -> str | None:
     return f"{low} – {high}"
 
 
-def render_job_card(scored_job: ScoredJob, gap_label: str, gap_icon: str) -> None:
+def stream_chat_reply(question: str):
+    """Yield the chat node's text tokens as the graph runs. Tool calls and
+    tool results are skipped here; the rerun afterwards redraws the full
+    history from the checkpoint, tool notes included."""
+    chat_input = {"chat_history": [HumanMessage(question)], "intent": "chat"}
+    for chunk, meta in job_matcher_app.stream(chat_input, CONFIG, stream_mode="messages"):
+        if meta.get("langgraph_node") != "chat_node" or not isinstance(chunk, AIMessageChunk):
+            continue
+        if chunk.tool_call_chunks and chunk.tool_call_chunks[0].get("name"):
+            yield "\n\n"  # keep text before and after a tool round apart
+        yield message_text(chunk)
+
+
+def render_job_card(scored_job: ScoredJob, bucket: str, gap_label: str, gap_icon: str) -> None:
     job = scored_job.job
-    with st.container(border=True):
+    with st.container(border=True, key=f"card_{bucket}_{job.id}"):
         title_col, score_col = st.columns([5, 1], vertical_alignment="center")
         title_col.markdown(f"#### {job.position}")
         with score_col, st.container(horizontal_alignment="right"):
@@ -132,8 +174,12 @@ with st.sidebar:
 
 # --- header ---
 
-st.title("CareerLens")
-st.caption("AI-powered job matching against your resume and preferences.")
+with st.container(key="hero"):
+    with st.container(horizontal=True, gap="small"):
+        st.badge("Multi-agent", icon=":material/hub:", color="violet")
+        st.badge("Live jobs from Adzuna", icon=":material/bolt:", color="green")
+    st.title("CareerLens", anchor=False)
+    st.caption("AI-powered job matching against your resume and preferences.")
 
 
 # --- search run ---
@@ -249,13 +295,13 @@ with results_col:
         if not realistic_matches:
             st.info("No realistic matches found.", icon=":material/search_off:")
         for scored_job in realistic_matches:
-            render_job_card(scored_job, "How to close the gap", ":material/trending_up:")
+            render_job_card(scored_job, "realistic", "How to close the gap", ":material/trending_up:")
 
     with stretch_tab:
         if not stretch_matches:
             st.info("No stretch matches found.", icon=":material/search_off:")
         for scored_job in stretch_matches:
-            render_job_card(scored_job, "Roadmap to get there", ":material/rocket_launch:")
+            render_job_card(scored_job, "stretch", "Roadmap to get there", ":material/rocket_launch:")
 
 with chat_col:
     st.markdown("### :material/forum: Ask about your matches")
@@ -263,7 +309,8 @@ with chat_col:
     chat_history = result.get("chat_history", [])
     asked_before = any(isinstance(m, HumanMessage) for m in chat_history)
 
-    with st.container(border=True, height=560):
+    chat_box = st.container(border=True, height=560)
+    with chat_box:
         if not asked_before:
             st.caption(
                 "Ask anything about these results — why a job scored the way it did, "
@@ -286,7 +333,7 @@ with chat_col:
                 st.caption(f":material/search: Checking past searches ({names})")
                 continue
             role_name = "user" if isinstance(msg, HumanMessage) else "assistant"
-            with st.chat_message(role_name):
+            with st.chat_message(role_name, avatar=AVATARS[role_name]):
                 st.write(text)
 
     # Suggestion chips only before the first question; once chat_history has a
@@ -306,9 +353,9 @@ with chat_col:
         pending_question = typed
 
     if pending_question:
-        with st.spinner("Thinking..."):
-            job_matcher_app.invoke(
-                {"chat_history": [HumanMessage(pending_question)], "intent": "chat"},
-                CONFIG,
-            )
+        with chat_box:
+            with st.chat_message("user", avatar=AVATARS["user"]):
+                st.write(pending_question)
+            with st.chat_message("assistant", avatar=AVATARS["assistant"]):
+                st.write_stream(stream_chat_reply(pending_question))
         st.rerun()
