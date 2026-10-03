@@ -10,7 +10,7 @@ from job_matcher.state import OrchestratorState
 
 
 def score_agent(state: OrchestratorState) -> dict:
-    llm = ChatAnthropic(model="claude-sonnet-5")
+    llm = ChatAnthropic(model="claude-sonnet-5", effort="low")
     prefs: Preferences = state["preferences"]
 
     messages = [
