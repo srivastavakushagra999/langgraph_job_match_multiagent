@@ -6,3 +6,5 @@ job_matcher/data/
 *.sqlite
 *.db
 .env
+# Eval fixtures contain the full resume text
+evals/fixtures/
